@@ -393,7 +393,22 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
     end
 
     -- Voice / accent selection (differs by backend)
-    if plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.PIPER then
+    if plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.PIPER_HTTP then
+        table.insert(menu, {
+            text_func = function()
+                return T(_("Server URL: %1"), plugin:getSetting("piper_http_url", "") ~= ""
+                    and plugin:getSetting("piper_http_url", "") or _("not configured"))
+            end,
+            callback = function(touchmenu) MenuBuilder.showHTTPServerDialog(plugin, touchmenu) end,
+            help_text = _("Set your Piper HTTP server address. Wi-Fi is required. Text is sent to this server over unencrypted HTTP; use a trusted network."),
+        })
+        table.insert(menu, {
+            text_func = function()
+                return T(_("HTTP voice: %1"), plugin:getSetting("piper_http_voice", "ru_RU-irina-medium"))
+            end,
+            sub_item_table_func = function() return MenuBuilder.buildHTTPVoiceMenu(plugin) end,
+        })
+    elseif plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.PIPER then
         table.insert(menu, {
             text_func = function()
                 local model = plugin:getSetting("piper_model_label", "default")
@@ -957,6 +972,12 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
         })
     end
 
+    -- Remote synthesis does not require a local Piper binary or voice model.
+    table.insert(available, {
+        id = engine.BACKENDS.PIPER_HTTP,
+        label = _("Piper HTTP (network server)"),
+    })
+
     -- sanoTTS: bundled int8 neural engine (~700KB voice, 512MB-friendly)
     if engine.sanotts_server then
         table.insert(available, {
@@ -1008,6 +1029,10 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
                 return engine.backend == backend.id
             end,
             callback = function(touchmenu_instance)
+                if plugin.sync_controller and (backend.id == engine.BACKENDS.PIPER_HTTP
+                    or engine.backend == engine.BACKENDS.PIPER_HTTP) then
+                    plugin.sync_controller:stop()
+                end
                 engine:setBackend(backend.id)
                 plugin:setSetting("tts_backend", backend.id)
                 -- An explicit engine choice clears the espeak-only mode
@@ -1023,6 +1048,61 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
         })
     end
 
+    return menu
+end
+
+local function httpModule()
+    local dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
+    return dofile(dir .. "piperhttp.lua")
+end
+
+local function stopForHTTPSettings(plugin)
+    if plugin.sync_controller then plugin.sync_controller:stop()
+    elseif plugin.tts_engine then plugin.tts_engine:stop() end
+end
+
+function MenuBuilder.showHTTPServerDialog(plugin, touchmenu)
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Piper HTTP server URL"),
+        input = plugin:getSetting("piper_http_url", ""),
+        input_hint = "http://hostname:port",
+        buttons = {{
+            { text = _("Cancel"), callback = function() UIManager:close(dialog) end },
+            { text = _("Save"), is_enter_default = true, callback = function()
+                local input = dialog:getInputText():match("^%s*(.-)%s*$")
+                local value, err = httpModule().validateURL(input)
+                if input ~= "" and not value then
+                    UIManager:show(InfoMessage:new{ text = err, timeout = 5 })
+                    return
+                end
+                stopForHTTPSettings(plugin)
+                plugin:setSetting("piper_http_url", value or "")
+                UIManager:close(dialog)
+                if touchmenu then touchmenu:updateItems() end
+            end },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function MenuBuilder.buildHTTPVoiceMenu(plugin)
+    local menu = {}
+    for _, voice in ipairs(httpModule().VOICES) do
+        local id = voice.id
+        table.insert(menu, {
+            text = voice.label,
+            checked_func = function()
+                return plugin:getSetting("piper_http_voice", "ru_RU-irina-medium") == id
+            end,
+            callback = function()
+                stopForHTTPSettings(plugin)
+                plugin:setSetting("piper_http_voice", id)
+            end,
+        })
+    end
     return menu
 end
 

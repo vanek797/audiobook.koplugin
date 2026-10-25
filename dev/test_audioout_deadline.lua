@@ -76,6 +76,7 @@ setfenv(assert(loadstring(body)),env)()
 local function engine(success)
     local calls={}
     local e=setmetatable({is_speaking=true,_audioout_active=true,backend='none',BACKENDS={},
+        _cancelHTTP=function()end,
         _stopKindleKeepalive=function()end,_androidPrefetchInvalidate=function()end,
         _killAudioProcess=function()end,fullCleanup=function(self)self.cleaned=true end,
         _audioout_client={

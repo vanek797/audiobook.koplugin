@@ -711,6 +711,7 @@ function SyncController:_beginReadingParsed(text, created_bar, keep_text)
     -- Honor espeak-only mode: if the user enabled the setting, skip Piper
     -- from the start.  Abandons are session-scoped and never write it.
     if not self._piper_abandoned
+            and self.tts_engine.backend ~= self.tts_engine.BACKENDS.PIPER_HTTP
             and self.plugin
             and self.plugin:getSetting("espeak_only_mode", false) then
         self._piper_abandoned = true
@@ -1220,8 +1221,14 @@ function SyncController:readNextSentence()
     local success = self.tts_engine:synthesize(sentence.text, function(synth_success, timing_data)
         if not synth_success then
             logger.warn("SyncController: Synthesis failed for sentence", controller.reading_sentence_idx)
+            -- Never silently skip book content or fall back to local TTS on a
+            -- network error. The remote backend is an explicit user choice.
+            if controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER_HTTP then
+                local reason = controller.tts_engine._http_error or "Piper HTTP synthesis failed."
+                controller:stop()
+                UIManager:show(InfoMessage:new{ text = reason, timeout = 8 })
             -- Piper failure: degrade the voice rather than drop book content
-            if controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER or controller.tts_engine.backend == controller.tts_engine.BACKENDS.SANOTTS then
+            elseif controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER or controller.tts_engine.backend == controller.tts_engine.BACKENDS.SANOTTS then
                 controller:_playViaEspeakOrSkip(sentence, "piper synthesize failed")
             elseif controller.tts_engine.backend == controller.tts_engine.BACKENDS.ANDROID then
                 -- Neural Android engines (VoxSherpa/Kokoro) get force-stopped
@@ -1276,6 +1283,7 @@ function SyncController:applySentenceTiming(sentence, timing_data)
         local current_time = 0
         local is_neural = self.tts_engine
             and (self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+                or self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER_HTTP
                 or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS
                 or self.tts_engine.backend == self.tts_engine.BACKENDS.ANDROID)
         for _, word in ipairs(sentence.words) do

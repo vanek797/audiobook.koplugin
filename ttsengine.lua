@@ -69,6 +69,7 @@ local TTSEngine = {
         FESTIVAL = "festival",
         ANDROID = "android",
         PIPER = "piper",
+        PIPER_HTTP = "piper-http",
         SANOTTS = "sanotts",
         SANOTTS_JP = "sanotts-jp",
         KINDLE_NATIVE = "kindle-native",
@@ -745,6 +746,9 @@ function TTSEngine:synthesize(text, callback)
     -- the sentence text available.  See kindle-native-tts-fallback in
     -- findAudioPlayer() and play().
     self._native_tts_text = text
+    if self.backend == self.BACKENDS.PIPER_HTTP then
+        return self:_synthesizeHTTP(text, callback)
+    end
     -- Kindle native TTS: text goes directly to playermgr (no WAV synthesis).
     -- The Kindle's Ivona SDK handles both synthesis and audio output.
     if self.backend == self.BACKENDS.KINDLE_NATIVE then
@@ -762,6 +766,47 @@ function TTSEngine:synthesize(text, callback)
     end
     logger.dbg("TTSEngine: Starting synthesis with backend:", self.backend)
     return self:synthesizeCommand(text, callback)
+end
+
+-- HTTP synthesis is intentionally independent of the local Piper queue.
+function TTSEngine:_synthesizeHTTP(text, callback)
+    if not self._http then
+        self._http = dofile(_utils_dir .. "piperhttp.lua"):new()
+    end
+    local generation = self._http_generation or 0
+    local function failed(reason)
+        self._http_error = tostring(reason)
+        logger.warn("TTSEngine: Piper HTTP:", self._http_error)
+        if callback then callback(false, nil) end
+    end
+    local plugin = self.plugin
+    local started, err = self._http:request({
+        url = plugin and plugin:getSetting("piper_http_url", "") or "",
+        voice = plugin and plugin:getSetting("piper_http_voice", "ru_RU-irina-medium") or nil,
+        timeout = plugin and plugin:getSetting("piper_http_timeout", 30) or 30,
+        text = text, rate = self.rate,
+    }, function(path, reason)
+        if generation ~= (self._http_generation or 0) or self.backend ~= self.BACKENDS.PIPER_HTTP then
+            if path then os.remove(path) end
+            return
+        end
+        if not path then failed(reason); return end
+        if self.current_audio_file then os.remove(self.current_audio_file) end
+        self.current_audio_file = path
+        self._http_error = nil
+        self:generateTimingEstimates(text)
+        self._current_audio_duration_ms = WavUtils.getDurationMs(path)
+        if callback then callback(true, self.timing_data) end
+    end)
+    if not started then failed(err) end
+    -- Errors are already delivered through the callback; do not dispatch a
+    -- second failure from SyncController's immediate-false branch.
+    return true
+end
+
+function TTSEngine:_cancelHTTP()
+    self._http_generation = (self._http_generation or 0) + 1
+    if self._http then self._http:cancel() end
 end
 
 --[[--
@@ -1881,6 +1926,7 @@ function TTSEngine:generateTimingEstimates(text)
     local current_time = 0
     local pos = 1
     local is_neural = self.backend == self.BACKENDS.PIPER
+        or self.backend == self.BACKENDS.PIPER_HTTP
         or self.backend == self.BACKENDS.SANOTTS
         or self.backend == self.BACKENDS.SANOTTS_JP
         or self.backend == self.BACKENDS.ANDROID
@@ -2071,6 +2117,9 @@ so when the current sentence finishes we can skip straight to playback.
 @return boolean Success
 --]]
 function TTSEngine:prefetch(text, use_espeak)
+    -- First version: one cancellable HTTP request at a time. Never launch a
+    -- speculative local synth or overwrite the playing sentence's state.
+    if self.backend == self.BACKENDS.PIPER_HTTP then return false end
     if not self.backend or not text or text == "" then
         return false
     end
@@ -2378,6 +2427,7 @@ Check if prefetched audio matches the given text and swap it in.
 @return boolean true if prefetch was used
 --]]
 function TTSEngine:usePrefetched(text)
+    if self.backend == self.BACKENDS.PIPER_HTTP then return false end
     -- Check single-slot prefetch (espeak-ng)
     if self._prefetch_file and self._prefetch_text == text then
         if self.current_audio_file then
@@ -2439,6 +2489,7 @@ _cleanPrefetch() when the file is no longer needed.
 @return number      Duration in ms
 --]]
 function TTSEngine:peekPrefetch(text)
+    if self.backend == self.BACKENDS.PIPER_HTTP then return nil end
     -- Check single-slot prefetch (espeak-ng)
     if self._prefetch_file and self._prefetch_text == text then
         local dur = self:getWavDurationMs(self._prefetch_file)
@@ -6978,6 +7029,7 @@ end
 Stop playback.
 --]]
 function TTSEngine:stop()
+    self:_cancelHTTP()
     -- Always bump generation and clear state, even if not speaking.
     -- This ensures stale scheduled callbacks (launchAndStart, checkProcess,
     -- updateTiming) exit immediately regardless of what state we were in.
@@ -7108,6 +7160,7 @@ Uses SIGTERM (not SIGKILL) so GStreamer can close the BT audio sink
 gracefully and not leave the BT firmware in a bad state.
 --]]
 function TTSEngine:forceKillAll()
+    self:_cancelHTTP()
     self._socket_clean = false
     -- Cancel any pending launchAndStart
     if self._pending_launch_fn then
@@ -7281,6 +7334,13 @@ function TTSEngine:setBackend(backend)
     if not valid then
         logger.warn("TTSEngine: Invalid backend:", backend)
         return
+    end
+    if self.backend ~= backend then
+        self:_cancelHTTP()
+        if self.backend == self.BACKENDS.PIPER_HTTP or backend == self.BACKENDS.PIPER_HTTP then
+            self:stop()
+            self._piper:stopServers()
+        end
     end
     -- Legacy speaker Kindles: the bundled Piper is an armhf glibc binary
     -- that cannot run on the soft-float 2.6.x firmware (and 256 MB cannot
