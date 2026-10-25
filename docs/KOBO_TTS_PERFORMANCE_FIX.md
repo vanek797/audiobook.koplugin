@@ -7,8 +7,13 @@
   Storyteller's margin handling is unchanged.
 - Piper FIFO readiness uses `O_NONBLOCK`, so a dead writer cannot block the
   readiness check indefinitely.
-- Original upstream audioout transport, synthesis, and synchronous shutdown
-  are retained.
+- Synthesis and synchronous shutdown are retained. Audioout socket transport
+  now uses Linux `SOCK_NONBLOCK` with one monotonic deadline spanning connect,
+  send, and receive. Partial writes and newline-framed partial replies are
+  handled; send uses `MSG_NOSIGNAL`.
+- Close/stop allows 250 ms for stop and 500 ms for release. Failure invokes
+  synchronous shutdown (200 ms), SIGTERM, then a SIGKILL fallback after 100 ms.
+  No shutdown work is deferred to a UI loop that may already be exiting.
 
 ## Withdrawn async experiment
 
@@ -31,10 +36,21 @@ are open. The selected engine and voices were left unchanged.
 
 ```sh
 luajit dev/test_tts_kobo_safety.lua
+luajit dev/test_audioout_deadline.lua
 ```
 
-The four checks cover default/opt-in panel layout and source invariants for
-FIFO readiness and synchronous teardown. They are not device integration
-tests. Confirm start/stop, pause/resume, and USB connection on the Kobo after
-restarting KOReader. Normal rendering, Bluetooth, and synthesis performance
-still depend on the upstream implementation.
+Four safety checks cover default/opt-in panel layout and source invariants
+for FIFO readiness and synchronous teardown. Ten additional checks mock
+backlogged connect, stalled send/receive, a shared deadline, fragmented JSON,
+closed/refused peers, teardown budgets, and engine fallback. They are not
+Linux kernel, Bluetooth, or device integration tests.
+
+The close-button investigation found the device log ending inside engine
+stop, before either the audio teardown acknowledgement or panel hide. A
+blocking connect before the old receive-only timeout was a concrete risk;
+the logs alone do not prove which syscall blocked. Added teardown boundary
+logging will distinguish this path on the next device run. Confirm close,
+start/stop, pause/resume, and USB connection after restarting KOReader.
+Normal rendering, Bluetooth, and synthesis performance still depend on the
+upstream implementation. The short release budget intentionally favors a
+responsive UI over preserving a slow or stuck Bluetooth pipeline.

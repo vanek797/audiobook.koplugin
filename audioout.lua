@@ -6,9 +6,10 @@ rendered-position clock measured by a sink-pad probe. This module is its
 KOReader-side half: lifecycle (spawn/kill), command transport, and status
 polling.
 
-Transport follows the mpv FFI client in mediaengine.lua: AF_UNIX stream
-socket, one connection per command, SO_RCVTIMEO so a wedged daemon can
-never freeze the UI. The daemon is line-JSON in, line-JSON out.
+Transport uses a Linux nonblocking AF_UNIX stream socket, one connection
+per command, with a single deadline covering connect/send/receive. Commands
+remain synchronous but bounded, including during UI/USB teardown. The daemon
+is line-JSON in, line-JSON out.
 
 Completion is polled, not pushed: compare status().done_count against the
 value taken when the play was issued, or check state == "idle" once
@@ -40,7 +41,6 @@ local AudioOut = {
 }
 
 local AF_UNIX, SOCK_STREAM = 1, 1
-local SOL_SOCKET, SO_RCVTIMEO = 1, 20
 
 function AudioOut:new(o)
     o = o or {}
@@ -63,48 +63,74 @@ function AudioOut:_command(cmd_table, timeout_ms)
         return nil, "no json module"
     end
     timeout_ms = timeout_ms or self.COMMAND_TIMEOUT_MS
-    local fd = ffi.C.socket(AF_UNIX, SOCK_STREAM, 0)
+    -- Linux SOCK_NONBLOCK: the old receive timeout did not cover connect()
+    -- or send(), so a full daemon listen backlog could freeze the UI forever.
+    local fd = ffi.C.socket(AF_UNIX, SOCK_STREAM + 2048, 0)
     if fd < 0 then return nil, "socket" end
     local addr = ffi.new("struct sockaddr_un")
     addr.sun_family = AF_UNIX
     ffi.copy(addr.sun_path, self.socket_path:sub(1, 107))
-    local rc = ffi.C.connect(fd, ffi.cast("struct sockaddr *", addr),
-                             ffi.sizeof(addr))
-    if rc ~= 0 then
+    local time = require("ui/time")
+    local deadline = time.now() + time.ms(timeout_ms)
+    local function finish(response, reason)
         ffi.C.close(fd)
-        return nil, "connect"
+        return response, reason
     end
-    -- Each recv blocks at most 50 ms; the loop bounds the total wait.
-    local tv = ffi.new("struct timeval")
-    tv.tv_sec = 0
-    tv.tv_usec = 50 * 1000
-    pcall(function()
-        ffi.C.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tv, ffi.sizeof(tv))
-    end)
+    local connected = false
+    while time.now() < deadline do
+        local rc = ffi.C.connect(fd, ffi.cast("struct sockaddr *", addr), ffi.sizeof(addr))
+        local err = rc ~= 0 and ffi.errno() or 0
+        if rc == 0 or err == 106 then -- EISCONN
+            connected = true
+            break
+        end
+        -- A nonblocking Unix connect can return EAGAIN for a full backlog;
+        -- retry it instead of entering a blocking connect before the deadline.
+        if err ~= 11 and err ~= 4 and err ~= 115 and err ~= 114 then
+            return finish(nil, "connect")
+        end
+        ffi.C.usleep(5000)
+    end
+    if not connected then return finish(nil, "connect timeout") end
     local payload = json.encode(cmd_table) .. "\n"
-    ffi.C.send(fd, payload, #payload, 0)
+    local sent = 0
+    while sent < #payload and time.now() < deadline do
+        local n = ffi.C.send(fd, payload:sub(sent + 1), #payload - sent, 16384) -- MSG_NOSIGNAL
+        if n > 0 then
+            sent = sent + tonumber(n)
+        elseif n < 0 then
+            local err = ffi.errno()
+            if err ~= 11 and err ~= 4 then return finish(nil, "send") end
+        end
+        if sent < #payload then ffi.C.usleep(5000) end
+    end
+    if sent < #payload then return finish(nil, "send timeout") end
     local buf = ffi.new("char[4096]")
-    local out = nil
-    local attempts = math.ceil(timeout_ms / 50)
-    while attempts > 0 and not out do
-        attempts = attempts - 1
+    local received = ""
+    while time.now() < deadline do
         local n = ffi.C.recv(fd, buf, 4096, 0)
-        if n and n > 0 then
-            for line in ffi.string(buf, n):gmatch("[^\r\n]+") do
+        if n == 0 then return finish(nil, "closed") end
+        if n > 0 then
+            received = received .. ffi.string(buf, n)
+            if #received > 65536 then return finish(nil, "response too large") end
+            while true do
+                local ending = received:find("\n", 1, true)
+                if not ending then break end
+                local line = received:sub(1, ending - 1)
+                received = received:sub(ending + 1)
                 local ok2, decoded = pcall(json.decode, line)
                 if ok2 and type(decoded) == "table" then
-                    if decoded.event then
-                        self._last_event = decoded   -- surfaced via takeEvent
-                    else
-                        out = decoded
-                    end
+                    if decoded.event then self._last_event = decoded
+                    else return finish(decoded) end
                 end
             end
+        elseif n < 0 then
+            local err = ffi.errno()
+            if err ~= 11 and err ~= 4 then return finish(nil, "recv") end
         end
+        ffi.C.usleep(5000)
     end
-    ffi.C.close(fd)
-    if out then return out end
-    return nil, self._last_event and "event only" or "timeout"
+    return finish(nil, "timeout")
 end
 
 function AudioOut:isRunning()
@@ -158,11 +184,13 @@ function AudioOut:start()
 end
 
 function AudioOut:stopDaemon()
-    self:_command({ cmd = "shutdown" }, 500)
-    -- socket unlink by the daemon is the confirmation; a kill fallback
-    -- guards against a wedged process
-    os.execute("sleep 0.3; killall audioout 2>/dev/null; rm -f "
-        .. self.socket_path)
+    self:_command({ cmd = "shutdown" }, 200)
+    -- Cleanup must finish before KOReader exits for USB mode. A wedged
+    -- GStreamer teardown may never process SIGTERM, so retain a hard fallback.
+    os.execute("killall audioout 2>/dev/null")
+    ffi.C.usleep(100000)
+    os.execute("killall -9 audioout 2>/dev/null; rm -f "
+        .. string.format("%q", self.socket_path))
 end
 
 function AudioOut:play(path, opts)
@@ -186,12 +214,12 @@ function AudioOut:resume(pos_ms)
     end
     return self:_command({ cmd = "resume" })
 end
-function AudioOut:stop() return self:_command({ cmd = "stop" }) end
+function AudioOut:stop() return self:_command({ cmd = "stop" }, 250) end
 -- play and flush may rebuild the pipeline, which takes seconds on ARM.
 function AudioOut:flush() return self:_command({ cmd = "flush" }, 8000) end
 -- Tear the pipeline down without killing the daemon: session stop. The
 -- next play() rebuilds lazily.
-function AudioOut:release() return self:_command({ cmd = "release" }, 8000) end
+function AudioOut:release() return self:_command({ cmd = "release" }, 500) end
 
 -- External stream mode (media path): an outside writer (ffmpeg) feeds the
 -- fifo; the daemon builds the pipeline and reports the probe clock.

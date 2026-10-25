@@ -7044,9 +7044,20 @@ function TTSEngine:stop()
     -- daemon process itself stays up for reuse; it is killed via
     -- forceKillAll/plugin teardown.
     if self._audioout_active and self._audioout_client then
-        self._audioout_client:stop()
-        self._audioout_client:release()
-        logger.warn("TTSEngine: audioout queue dropped, pipeline released")
+        logger.warn("TTSEngine: stopping audioout (bounded teardown)")
+        local stopped, stop_error = self._audioout_client:stop()
+        local released, release_error
+        if stopped and stopped.ok then
+            released, release_error = self._audioout_client:release()
+        end
+        if not (stopped and stopped.ok and released and released.ok) then
+            logger.warn("TTSEngine: audioout teardown failed; terminating daemon:",
+                stop_error or release_error or (stopped and stopped.error)
+                    or (released and released.error) or "no acknowledgement")
+            self._audioout_client:stopDaemon()
+        end
+        self._audioout_active = nil
+        logger.warn("TTSEngine: audioout teardown complete")
     end
 
     
