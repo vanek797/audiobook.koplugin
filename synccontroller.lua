@@ -2892,6 +2892,11 @@ function SyncController:resume(auto)
         self.state = self.STATE.PLAYING
         -- Clear the user-paused flag on any successful resume
         self._user_paused = false
+        if self._http_volume_dirty then
+            self._http_volume_dirty = false
+            self:_restartFromCurrentSentence()
+            return
+        end
 
         -- Adjust sentence sync start to account for pause duration
         if self.sentence_sync_start and self.pause_time then
@@ -3243,6 +3248,7 @@ function SyncController:stop(opts)
                 and self.tts_engine._android_prefetch_session_disabled or false)
     end
     self.state = self.STATE.STOPPED
+    self._http_volume_dirty = false
 
     -- Cancel any pending next-sentence timer so a stale closure cannot
     -- fire after stop (or worse, after a *new* session has started).
@@ -3560,17 +3566,17 @@ sentence being spoken, so a mid-session speed (or voice) change is heard at
 once instead of after the prefetched queue and the current concat group drain.
 Mirrors the primitives seekToProgress uses.
 --]]
-function SyncController:_restartFromCurrentSentence()
+function SyncController:_restartFromCurrentSentence(target)
     if not self.parsed_data or not self.total_sentences or self.total_sentences < 1 then
         return
     end
-    local target = (self.current_sentence and self.current_sentence.index)
+    target = target or (self.current_sentence and self.current_sentence.index)
         or self.reading_sentence_idx
     target = tonumber(target)
     if not target or target < 1 then return end
     if target > self.total_sentences then target = self.total_sentences end
     logger.warn("SyncController: restarting at sentence", target,
-        "to apply the new speech rate")
+        "to apply updated speech settings")
     self:_cleanConcatFiles()
     pcall(function() self.tts_engine:stop() end)
     if self.highlight_manager then
@@ -3602,11 +3608,21 @@ function SyncController:setSpeechVolumePct(pct)
     if pct < 0 then pct = 0 end
     if pct > 100 then pct = 100 end
     local vol = pct / 100
+    local previous = self.tts_engine and self.tts_engine.volume
     if self.plugin and self.plugin.setSetting then
         self.plugin:setSetting("speech_volume", vol)
     end
     if self.tts_engine and self.tts_engine.setVolume then
         self.tts_engine:setVolume(vol)
+    end
+    if previous ~= vol and self.tts_engine and self.tts_engine._httpSoftwareVolume
+        and self.tts_engine:_httpSoftwareVolume() then
+        if self.state == self.STATE.PLAYING or self.state == self.STATE.LOADING then
+            self:_restartFromCurrentSentence(self.state == self.STATE.LOADING and self.reading_sentence_idx or nil)
+        elseif self.state == self.STATE.PAUSED then
+            -- Do not turn a volume adjustment into an unsolicited resume.
+            self._http_volume_dirty = true
+        end
     end
 end
 

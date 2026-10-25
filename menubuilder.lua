@@ -597,6 +597,15 @@ function MenuBuilder.buildPitchMenu(plugin)
     return menu
 end
 
+function MenuBuilder.applySpeechVolume(plugin, value)
+    if plugin.sync_controller and plugin.sync_controller.setSpeechVolumePct then
+        plugin.sync_controller:setSpeechVolumePct(math.floor(value * 100 + 0.5))
+    else
+        plugin:setSetting("speech_volume", value)
+        if plugin.tts_engine then plugin.tts_engine:setVolume(value) end
+    end
+end
+
 function MenuBuilder.buildVolumeMenu(plugin)
     local volumes = {0.25, 0.50, 0.75, 1.0}
     local menu = {}
@@ -607,8 +616,7 @@ function MenuBuilder.buildVolumeMenu(plugin)
                 return plugin:getSetting("speech_volume", 1.0) == v
             end,
             callback = function()
-                plugin:setSetting("speech_volume", v)
-                plugin.tts_engine:setVolume(v)
+                MenuBuilder.applySpeechVolume(plugin, v)
             end,
         })
     end
@@ -2471,8 +2479,7 @@ function MenuBuilder.showTtsSettingsPicker(plugin)
                 plugin:getSetting("speech_volume", 1.0),
                 function(v) return string.format("%d%%", math.floor(v * 100)) end,
                 function(v)
-                    plugin:setSetting("speech_volume", v)
-                    if plugin.tts_engine then plugin.tts_engine:setVolume(v) end
+                    MenuBuilder.applySpeechVolume(plugin, v)
                     if plugin.sync_controller and plugin.sync_controller.playback_bar
                         and plugin.sync_controller.playback_bar.updateVolume then
                         pcall(function()

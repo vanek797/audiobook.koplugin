@@ -58,6 +58,16 @@ network gaps. Word timing is estimated and scaled to the WAV duration, not
 server-provided alignment. A failed request stops read-aloud and shows an error;
 it does not silently skip content or switch to a local synthesizer.
 
+### Volume with audioout disabled
+
+When `audioout_enabled` is false, the HTTP worker attenuates PCM16 WAV samples
+before returning audio to the player. This does not require GStreamer's volume
+element and avoids applying the same gain twice. Zero percent is digital silence.
+Changing volume while playing restarts the current sentence with the new gain;
+while loading it restarts the pending sentence. Adjusting a paused session does
+not resume it: the new gain applies when the user resumes. With audioout enabled,
+the existing live daemon gain control remains in use.
+
 Moving synthesis to a server does not replace the reader's Bluetooth player or
 fix every possible local audio/firmware failure.
 
@@ -78,6 +88,7 @@ Host checks (LuaJIT):
 ```sh
 luajit dev/test_piper_http.lua
 luajit dev/test_piper_http_menu.lua
+luajit dev/test_piper_http_volume.lua
 luajit dev/test_audioout_deadline.lua
 luajit dev/test_tts_kobo_safety.lua
 ```

@@ -780,11 +780,13 @@ function TTSEngine:_synthesizeHTTP(text, callback)
         if callback then callback(false, nil) end
     end
     local plugin = self.plugin
+    local software_volume = self:_httpSoftwareVolume()
+    local gain = software_volume and self.volume or 1
     local started, err = self._http:request({
         url = plugin and plugin:getSetting("piper_http_url", "") or "",
         voice = plugin and plugin:getSetting("piper_http_voice", "ru_RU-irina-medium") or nil,
         timeout = plugin and plugin:getSetting("piper_http_timeout", 30) or 30,
-        text = text, rate = self.rate,
+        text = text, rate = self.rate, volume = gain,
     }, function(path, reason)
         if generation ~= (self._http_generation or 0) or self.backend ~= self.BACKENDS.PIPER_HTTP then
             if path then os.remove(path) end
@@ -793,6 +795,7 @@ function TTSEngine:_synthesizeHTTP(text, callback)
         if not path then failed(reason); return end
         if self.current_audio_file then os.remove(self.current_audio_file) end
         self.current_audio_file = path
+        self._http_applied_gain = software_volume and gain or nil
         self._http_error = nil
         self:generateTimingEstimates(text)
         self._current_audio_duration_ms = WavUtils.getDurationMs(path)
@@ -802,6 +805,11 @@ function TTSEngine:_synthesizeHTTP(text, callback)
     -- Errors are already delivered through the callback; do not dispatch a
     -- second failure from SyncController's immediate-false branch.
     return true
+end
+
+function TTSEngine:_httpSoftwareVolume()
+    return self.backend == self.BACKENDS.PIPER_HTTP and self.plugin
+        and not self.plugin:getSetting("audioout_enabled", true)
 end
 
 function TTSEngine:_cancelHTTP()
@@ -6510,6 +6518,9 @@ element when the device's GStreamer has the volume element, else empty so
 a stripped build can never stop playback.  Result cached per session.
 --]]
 function TTSEngine:_gstVolumeFragment()
+    -- HTTP WAVs may already be attenuated in the worker. Do not apply the
+    -- same gain again even if the legacy GStreamer volume plugin exists.
+    if self.backend == self.BACKENDS.PIPER_HTTP and self._http_applied_gain ~= nil then return "" end
     if self._gst_volume_available == nil then
         local h = io.popen("gst-inspect-1.0 volume 2>/dev/null | head -1")
         local res = h and h:read("*a") or ""

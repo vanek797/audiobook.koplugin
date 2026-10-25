@@ -27,6 +27,70 @@ function PiperHTTP.isWav(path)
         and header:sub(9, 12) == "WAVE" and size > 44
 end
 
+-- Apply attenuation in the HTTP worker, so legacy players need no mixer or
+-- GStreamer volume plugin. Piper returns little-endian PCM16 WAV audio.
+function PiperHTTP.scaleWav(path, gain)
+    gain = math.max(0, math.min(1, tonumber(gain) or 1))
+    if gain == 1 then return true end
+    local f, err = io.open(path, "r+b")
+    if not f then return nil, tostring(err) end
+    local function fail(reason) f:close(); return nil, reason end
+    local function le16(s) return s:byte(1) + s:byte(2) * 256 end
+    local function le32(s) return le16(s:sub(1, 2)) + le16(s:sub(3, 4)) * 65536 end
+    local size = f:seek("end")
+    f:seek("set", 0)
+    local header = f:read(12) or ""
+    if header:sub(1, 4) ~= "RIFF" or header:sub(9, 12) ~= "WAVE" then
+        return fail("Invalid WAV header")
+    end
+    local position, pcm16, data_position, data_size = 12, false
+    while position + 8 <= size do
+        f:seek("set", position)
+        local chunk = f:read(8)
+        if not chunk or #chunk ~= 8 then return fail("Truncated WAV chunk") end
+        local length = le32(chunk:sub(5, 8))
+        local start = position + 8
+        if start + length > size then return fail("Truncated WAV data") end
+        if chunk:sub(1, 4) == "fmt " and length >= 16 then
+            local format = f:read(16)
+            pcm16 = le16(format:sub(1, 2)) == 1 and le16(format:sub(15, 16)) == 16
+        elseif chunk:sub(1, 4) == "data" then
+            data_position, data_size = start, length
+        end
+        position = start + length + length % 2
+    end
+    if not pcm16 or not data_position or data_size % 2 ~= 0 then
+        return fail("Piper HTTP volume requires PCM16 WAV audio")
+    end
+    local offset = 0
+    while offset < data_size do
+        f:seek("set", data_position + offset)
+        local block = f:read(math.min(4096, data_size - offset))
+        if not block or #block == 0 or #block % 2 ~= 0 then return fail("Short WAV read") end
+        local scaled
+        if gain == 0 then
+            scaled = string.rep("\0", #block)
+        else
+            local samples = {}
+            for i = 1, #block, 2 do
+                local value = block:byte(i) + block:byte(i + 1) * 256
+                if value >= 32768 then value = value - 65536 end
+                value = math.floor(value * gain + 0.5)
+                if value < 0 then value = value + 65536 end
+                samples[#samples + 1] = string.char(value % 256, math.floor(value / 256))
+            end
+            scaled = table.concat(samples)
+        end
+        f:seek("set", data_position + offset)
+        local written, reason = f:write(scaled)
+        if not written then return fail(tostring(reason)) end
+        offset = offset + #block
+    end
+    local closed, reason = f:close()
+    if not closed then return nil, tostring(reason) end
+    return true
+end
+
 -- Only called inside the worker (or isolated tests). No shell or external curl.
 function PiperHTTP.fetch(options, path)
     local http = require("socket.http")
@@ -64,6 +128,8 @@ function PiperHTTP.fetch(options, path)
         os.remove(part)
         return nil, "Piper HTTP returned invalid or empty WAV audio."
     end
+    local scaled, scale_error = PiperHTTP.scaleWav(part, options.volume)
+    if not scaled then os.remove(part); return nil, scale_error end
     local renamed, reason = os.rename(part, path)
     if not renamed then os.remove(part); return nil, tostring(reason) end
     return true
@@ -121,7 +187,8 @@ function PiperHTTP:request(options, callback)
     local timeout = math.max(5, math.min(120, tonumber(options.timeout) or 30))
     local base = os.tmpname()
     local job = { base = base, path = base .. ".wav", error_path = base .. ".error" }
-    local request = { url = url, text = options.text, voice = voice, rate = rate }
+    local request = { url = url, text = options.text, voice = voice, rate = rate,
+        volume = math.max(0, math.min(1, tonumber(options.volume) or 1)) }
     local pid, fork_error = self.util.runInSubProcess(function()
         local ok, success, reason = pcall(PiperHTTP.fetch, request, job.path)
         if not ok or not success then
