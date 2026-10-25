@@ -822,7 +822,7 @@ function SyncController:readNextSentence()
             -- Prefetched during the previous sentence's playback (issue #49)
             fb_file = self.tts_engine.current_audio_file
         else
-            return self:_playViaEspeakOrSkip(sentence, "espeak-only mode")
+            fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
         end
         if fb_file then
             controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
@@ -928,7 +928,16 @@ function SyncController:readNextSentence()
         if use_espeak_early then
             logger.warn("SyncController: espeak cold-start fallback for sentence",
                 self.reading_sentence_idx, "(early, Piper status:", piper_status, ")")
-            return self:_playViaEspeakOrSkip(sentence, "early cold start", true)
+            local fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
+            if fb_file then
+                self._espeak_fallback_count = (self._espeak_fallback_count or 0) + 1
+                self:_checkPiperRtfEscalation()
+                self:_checkPiperAbandon()
+                controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
+                controller:beginSentencePlayback(sentence)
+                return
+            end
+            logger.warn("SyncController: espeak early fallback failed, waiting for Piper")
         end
 
         logger.warn("SyncController: Waiting for Piper prefetch (status:", piper_status,
@@ -1130,7 +1139,17 @@ function SyncController:readNextSentence()
         if use_espeak_fallback then
             logger.warn("SyncController: espeak cold-start fallback for sentence",
                 self.reading_sentence_idx)
-            return self:_playViaEspeakOrSkip(sentence, "cold start", true)
+            local fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
+            if fb_file then
+                self._espeak_fallback_count = (self._espeak_fallback_count or 0) + 1
+                self:_checkPiperRtfEscalation()
+                self:_checkPiperAbandon()
+                controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
+                controller:beginSentencePlayback(sentence)
+                return  -- Piper keeps synthesizing in background; readNextSentence will pick up Piper audio
+            end
+            -- If espeak fallback failed, fall through to Piper wait
+            logger.warn("SyncController: espeak fallback failed, waiting for Piper")
         end
 
         -- Show notification while waiting for Piper (no espeak fallback or it failed)
@@ -1927,8 +1946,7 @@ for the reflow only then).
 Rolling (CreDocument/EPUB) only — paged documents have fixed layout.
 --]]
 function SyncController:_reserveBarSpace()
-    -- Changing live CRE margins may reflow the entire EPUB. Keep the TTS
-    -- bar over the page by default; do not affect Storyteller's inset policy.
+    -- Avoid full EPUB reflow at TTS startup. Leave Storyteller unchanged.
     if self.plugin and not self.plugin:getSetting("reserve_tts_bar_space", false) then
         self._bar_space_reflowed = false
         return
@@ -2557,7 +2575,7 @@ function SyncController:startSentenceSyncLoop(sentence)
             self._latency_locked = true
             -- 400 ms: the sync tick runs at 20 Hz on the UI thread; a
             -- wedged daemon must never hold it for seconds.
-            local st = self.tts_engine._audioout_client:statusCached(400)
+            local st = self.tts_engine._audioout_client:status(400)
             if not st or not st.pos_ms then
                 UIManager:scheduleIn(0.05, syncUpdate)
                 return
@@ -3036,39 +3054,27 @@ through to readNextSentence() only when espeak is unavailable or fails.
 @param reason string  Log context
 @return boolean  true when the sentence is being played via espeak
 --]]
-function SyncController:_playViaEspeakOrSkip(sentence, reason, retry_piper)
-    if not (self.tts_engine and self.tts_engine.espeak_bin) then
-        self:readNextSentence()
-        return false
-    end
-    self._espeak_request_generation = (self._espeak_request_generation or 0) + 1
-    local generation = self._espeak_request_generation
-    local index = self.reading_sentence_idx
-    local engine = self.tts_engine
-    engine:espeakSynthesizeFallbackAsync(sentence.text, function(file, timing, failure)
-        if failure == "cancelled" then return end
-        if generation ~= self._espeak_request_generation
-            or self.reading_sentence_idx ~= index or self.state ~= self.STATE.LOADING then
-            if file then os.remove(file) end
-            return
-        end
-        if file then
-            engine.current_audio_file, engine.timing_data = file, timing
+function SyncController:_playViaEspeakOrSkip(sentence, reason)
+    if self.tts_engine and self.tts_engine.espeak_bin then
+        logger.warn("SyncController: espeak fallback for sentence",
+            self.reading_sentence_idx, "(", reason, ")")
+        local fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
+        if fb_file then
             self._espeak_fallback_count = (self._espeak_fallback_count or 0) + 1
             self:_checkPiperRtfEscalation()
             self:_checkPiperAbandon()
-            self:applySentenceTiming(sentence, timing)
+            self:applySentenceTiming(sentence, self.tts_engine.timing_data)
             self:beginSentencePlayback(sentence)
-        else
-            logger.warn("SyncController: async espeak fallback failed:", reason)
-            if retry_piper then
-                self._piper_warmed_up = true -- do not retry the failed cold-start path
-                self.reading_sentence_idx = index - 1
-            end
-            self:readNextSentence()
+            return true
         end
-    end)
-    return true -- request pending; no synthesis work blocks the event loop
+        logger.warn("SyncController: espeak fallback failed (", reason,
+            "), skipping sentence")
+    else
+        logger.warn("SyncController: no espeak fallback available (", reason,
+            "), skipping sentence")
+    end
+    self:readNextSentence()
+    return false
 end
 
 --[[--
@@ -3207,7 +3213,6 @@ end
 Stop playback completely.
 --]]
 function SyncController:stop(opts)
-    self._espeak_request_generation = (self._espeak_request_generation or 0) + 1
     -- Log at WARN level with traceback when stopping from an active state
     -- so we can diagnose unexpected stops (e.g. "Chain BLOCKED" on Kindle).
     -- Mirror the reason into the plugin debug log: bug reports usually
