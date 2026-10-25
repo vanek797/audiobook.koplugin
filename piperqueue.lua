@@ -650,8 +650,10 @@ function PiperQueue:startServers()
         os.execute(string.format('rm -f "%s" "%s.pid" "%s.piper_pid" "%s.sh" "%s.log"',
             fifo, fifo, fifo, fifo, fifo))
     end
-    os.execute("usleep 200000")
-
+    self._server_launch_generation = (self._server_launch_generation or 0) + 1
+    local generation = self._server_launch_generation
+    local function launchServers()
+    if self._server_launch_generation ~= generation or not self._servers_starting then return end
     local base_cmd = self:buildBaseCommand()
 
     for i = 1, pool do
@@ -721,6 +723,7 @@ rm -f "$FIFO" "${FIFO}.pid" "${FIFO}.piper_pid"
     local pq = self
     local start_time = UIManager:getTime()
     local function checkServersReady()
+        if pq._server_launch_generation ~= generation or not pq._servers_starting then return end
         local all_ready = true
         for i = 1, pool do
             if not pq._servers[i] then
@@ -734,9 +737,10 @@ rm -f "$FIFO" "${FIFO}.pid" "${FIFO}.piper_pid"
                     -- file gets written but the FIFO is missing (issue #18).
                     local fifo = SERVER_PREFIX .. i
                     local fifo_ok = false
-                    local ff = io.open(fifo, "r")
-                    if ff then
-                        ff:close()
+                    -- A blocking FIFO open waits forever when its writer died.
+                    local fd = ffi.C.open(fifo, 2048) -- O_RDONLY | O_NONBLOCK
+                    if fd >= 0 then
+                        ffi.C.close(fd)
                         fifo_ok = true
                     end
                     if not fifo_ok then
@@ -790,12 +794,15 @@ rm -f "$FIFO" "${FIFO}.pid" "${FIFO}.piper_pid"
         end
     end
     UIManager:scheduleIn(0.3, checkServersReady)
+    end -- launchServers
+    UIManager:scheduleIn(0.2, launchServers)
 end
 
 --[[--
 Stop persistent Piper servers.
 --]]
 function PiperQueue:stopServers()
+    self._server_launch_generation = (self._server_launch_generation or 0) + 1
     -- No early return: even if we think servers aren't running, there may
     -- be orphan processes from a previous crash.  Always kill by PID file
     -- and killall to be safe.  Sweep the larger legacy pool so slots from a

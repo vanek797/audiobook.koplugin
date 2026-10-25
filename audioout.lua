@@ -114,6 +114,7 @@ end
 
 -- Spawn the daemon and wait for its socket. Returns true, or nil + reason.
 function AudioOut:start()
+    self._daemon_generation = (self._daemon_generation or 0) + 1
     if self:isRunning() then
         return true
     end
@@ -158,11 +159,61 @@ function AudioOut:start()
 end
 
 function AudioOut:stopDaemon()
-    self:_command({ cmd = "shutdown" }, 500)
-    -- socket unlink by the daemon is the confirmation; a kill fallback
-    -- guards against a wedged process
-    os.execute("sleep 0.3; killall audioout 2>/dev/null; rm -f "
-        .. self.socket_path)
+    local UIManager = require("ui/uimanager")
+    self._daemon_generation = (self._daemon_generation or 0) + 1
+    local generation = self._daemon_generation
+    self:commandAsync({ cmd = "shutdown" }, 500, function()
+        UIManager:scheduleIn(0.3, function()
+            -- Never kill a daemon started by a newer reading session.
+            if self._daemon_generation ~= generation then return end
+            os.execute("killall audioout 2>/dev/null; rm -f "
+                .. string.format("%q", self.socket_path))
+        end)
+    end)
+end
+
+-- Startup must not sleep/poll in the UI thread. Callback is invoked once.
+function AudioOut:startAsync(callback, is_current)
+    local UIManager = require("ui/uimanager")
+    local time = require("ui/time")
+    self._daemon_generation = (self._daemon_generation or 0) + 1
+    local generation = self._daemon_generation
+    local function current()
+        return self._daemon_generation == generation and (not is_current or is_current())
+    end
+    self:commandAsync({ cmd = "ping" }, 400, function(response)
+        if not current() then return end
+        if response and response.ok then callback(true); return end
+        if not self.daemon_path or not self.daemon_path:match("%S") then
+            callback(nil, "no daemon path"); return
+        end
+        local function spawn()
+            os.execute(string.format(
+                '%s --socket %q --fifo %q --rate %d --channels %d --volume %.2f > /dev/null 2>> %q &',
+                self.daemon_path, self.socket_path, self:fifoPath(), self.rate,
+                self.channels, self.volume, self.log_path))
+        end
+        spawn()
+        local deadline = time.now() + time.ms(self.STARTUP_WAIT_MS)
+        local retried = false
+        local function poll()
+            if not current() then return end
+            self:commandAsync({ cmd = "ping" }, 200, function(reply)
+                if not current() then return end
+                if reply and reply.ok then callback(true); return end
+                if time.now() >= deadline then
+                    if retried then callback(nil, "daemon did not come up"); return end
+                    retried = true
+                    os.execute("killall -9 audioout 2>/dev/null; rm -f "
+                        .. string.format("%q", self.socket_path))
+                    spawn()
+                    deadline = time.now() + time.ms(self.STARTUP_WAIT_MS)
+                end
+                UIManager:scheduleIn(0.1, poll)
+            end)
+        end
+        UIManager:scheduleIn(0.1, poll)
+    end)
 end
 
 function AudioOut:play(path, opts)
@@ -191,7 +242,10 @@ function AudioOut:stop() return self:_command({ cmd = "stop" }) end
 function AudioOut:flush() return self:_command({ cmd = "flush" }, 8000) end
 -- Tear the pipeline down without killing the daemon: session stop. The
 -- next play() rebuilds lazily.
-function AudioOut:release() return self:_command({ cmd = "release" }, 8000) end
+function AudioOut:release()
+    -- Release is fire-and-forget; callers do not consume a response.
+    return self:commandAsync({ cmd = "release" }, 8000)
+end
 
 -- External stream mode (media path): an outside writer (ffmpeg) feeds the
 -- fifo; the daemon builds the pipeline and reports the probe clock.
@@ -234,8 +288,102 @@ end
 function AudioOut:setVolume(v)
     return self:_command({ cmd = "volume", value_x1000 = math.floor(v * 1000 + 0.5) })
 end
+-- Nonblocking transport for commands issued by the UI thread. One socket per
+-- request; retain partial JSON frames and enforce a wall-clock deadline.
+function AudioOut:commandAsync(command, timeout_ms, callback)
+    local UIManager = require("ui/uimanager")
+    local time = require("ui/time")
+    local json = require("json")
+    local deadline = time.now() + time.ms(timeout_ms or self.COMMAND_TIMEOUT_MS)
+    local fd = ffi.C.socket(AF_UNIX, SOCK_STREAM + 2048, 0) -- Linux SOCK_NONBLOCK
+    local finished = false
+    local function finish(response, reason)
+        if finished then return end
+        finished = true
+        if fd >= 0 then ffi.C.close(fd) end
+        if callback then callback(response, reason) end
+    end
+    if fd < 0 then finish(nil, "socket"); return end
+    local addr = ffi.new("struct sockaddr_un")
+    addr.sun_family = AF_UNIX
+    ffi.copy(addr.sun_path, self.socket_path:sub(1, 107))
+    local connected = ffi.C.connect(fd, ffi.cast("struct sockaddr *", addr), ffi.sizeof(addr)) == 0
+    if not connected then
+        local err = ffi.errno()
+        if err ~= 115 and err ~= 11 then finish(nil, "connect"); return end
+    end
+    local payload, offset, received = json.encode(command) .. "\n", 0, ""
+    local function tick()
+        if finished then return end
+        if time.now() >= deadline then finish(nil, "timeout"); return end
+        if offset < #payload then
+            -- MSG_NOSIGNAL prevents a closed daemon socket from killing KOReader.
+            local n = ffi.C.send(fd, payload:sub(offset + 1), #payload - offset, 16384)
+            if n > 0 then
+                offset = offset + tonumber(n)
+            elseif n < 0 then
+                local err = ffi.errno()
+                if err ~= 11 and err ~= 4 and err ~= 107 then
+                    finish(nil, "send"); return
+                end
+            end
+        end
+        if offset == #payload then
+            local buf = ffi.new("char[4096]")
+            -- Bound work per tick even if the daemon floods unsolicited events.
+            for _ = 1, 4 do
+                local n = ffi.C.recv(fd, buf, 4096, 0)
+                if n == 0 then finish(nil, "closed"); return end
+                if n < 0 then
+                    local err = ffi.errno()
+                    if err ~= 11 and err ~= 4 then finish(nil, "recv"); return end
+                    break
+                end
+                received = received .. ffi.string(buf, n)
+                if #received > 65536 then finish(nil, "response too large"); return end
+                while true do
+                    local ending = received:find("\n", 1, true)
+                    if not ending then break end
+                    local line = received:sub(1, ending - 1)
+                    received = received:sub(ending + 1)
+                    local ok, value = pcall(json.decode, line)
+                    if ok and type(value) == "table" then
+                        if value.event then self._last_event = value
+                        else finish(value); return end
+                    end
+                end
+            end
+        end
+        UIManager:scheduleIn(0.02, tick)
+    end
+    UIManager:scheduleIn(0, tick)
+    return function() finish(nil, "cancelled") end
+end
+
+-- Keep the synchronous API for media-engine callers which require an
+-- immediate capability probe. TTS polling uses statusCached instead.
 function AudioOut:status(timeout_ms)
     return self:_command({ cmd = "status" }, timeout_ms)
+end
+
+function AudioOut:statusCached(timeout_ms)
+    local time = require("ui/time")
+    local now = time.now()
+    if not self._status_pending and (not self._status_requested_at
+        or now - self._status_requested_at >= time.ms(100)) then
+        self._status_pending = true
+        self._status_requested_at = now
+        local epoch = self._status_epoch
+        self:commandAsync({ cmd = "status" }, timeout_ms or 400, function(response)
+            self._status_pending = false
+            if epoch ~= self._status_epoch then return end
+            self._status_cache = response
+            self._status_time = time.now()
+        end)
+    end
+    if self._status_time and time.now() - self._status_time <= time.ms(750) then
+        return self._status_cache
+    end
 end
 function AudioOut:takeEvent()
     local e = self._last_event

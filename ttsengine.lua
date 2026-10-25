@@ -1983,15 +1983,16 @@ function TTSEngine:appendGapToWav(path, duration_ms, gap_type)
     return WavUtils.appendSilence(path, duration_ms)
 end
 --[[--
-Quick espeak-ng synthesis for cold-start fallback.
-Synthesizes text with the bundled espeak-ng binary (typically <300ms on ARM)
-and returns the WAV file path, or nil on failure.
-This works even when the active backend is Piper.
+Asynchronous espeak-ng synthesis for fallback and lookahead.
+The completion callback receives (WAV path, timing), or nil on failure.
+Cancellation is reported as (nil, nil, "cancelled"). Does not overwrite the
+currently playing file or timing. Works even when the backend is Piper.
 @param text string Text to synthesize
-@return string|nil WAV file path on success
+@param callback function Completion handler
+@return boolean Whether a background request was started
 --]]
-function TTSEngine:espeakSynthesizeFallback(text)
-    if not self.espeak_bin then return nil end
+function TTSEngine:espeakSynthesizeFallbackAsync(text, callback)
+    if not self.espeak_bin then callback(nil); return false end
     local temp_dir = self._android_tts and self._android_tts:getTempDir() or "/tmp"
     self.file_counter = (self.file_counter or 0) + 1
     local audio_file = temp_dir .. "/audiobook_espeak_fb_" .. os.time() .. "_" .. self.file_counter .. ".wav"
@@ -2025,31 +2026,71 @@ function TTSEngine:espeakSynthesizeFallback(text)
         '%s%s -v %s -s %d -a 100 -w "%s" "%s" 2>&1',
         exec_prefix, self.espeak_bin, voice, speed, audio_file, self:escapeText(text)
     )
-    logger.warn("TTSEngine: espeak fallback synthesis for cold-start")
-    local handle = io.popen(cmd, "r")
-    if handle then
-        handle:read("*a")
-        handle:close()
+    logger.warn("TTSEngine: async espeak fallback synthesis")
+    local done_path, log_path = audio_file .. ".done", audio_file .. ".log"
+    local pid_path = audio_file .. ".pid"
+    os.remove(done_path)
+    -- Publish the marker atomically: observing an empty echo-created file
+    -- otherwise races the writer and misreports a successful synthesis.
+    os.execute(string.format(
+        '( %s > %q 2>&1 & child=$!; echo "$child" > %q; wait "$child"; rc=$?; '
+        .. 'echo "$rc" > %q; mv %q %q ) >/dev/null 2>&1 &',
+        cmd, log_path, pid_path, done_path .. ".tmp", done_path .. ".tmp", done_path))
+    local deadline = time.now() + time.s(30)
+    local finished = false
+    self._fallback_jobs = self._fallback_jobs or {}
+    local function cleanup()
+        os.remove(done_path); os.remove(done_path .. ".tmp")
+        os.remove(log_path); os.remove(pid_path)
     end
-    local f = io.open(audio_file, "r")
-    if f then
-        f:close()
-        -- Smooth boundary clicks at start/end
-        WavUtils.applyFade(audio_file, 15)
-        -- Resample espeak output (22050Hz) to match Piper model rate if needed
-        local target_sr = self._piper_sample_rate or 22050
-        if target_sr ~= 22050 then
-            WavUtils.resampleFile(audio_file, target_sr)
+    local function finish(file, timing, reason)
+        if finished then return end
+        finished = true
+        self._fallback_jobs[audio_file] = nil
+        cleanup()
+        callback(file, timing, reason)
+    end
+    local function cancel(reason)
+        if finished then return end
+        local pf = io.open(pid_path, "r")
+        if pf then
+            local pid = tonumber(pf:read("*a")); pf:close()
+            if pid and pid > 1 then os.execute("kill " .. pid .. " 2>/dev/null") end
         end
-        -- Generate timing estimates for the espeak audio
-        self:generateTimingEstimates(text)
-        self.current_audio_file = audio_file
-        -- Keep _native_tts_text intact: the Kindle native TTS fallback path
-        -- (used when gst-play is broken on stripped GStreamer firmware) needs
-        -- the sentence text.  Clearing it here causes "no text to speak".
-        return audio_file
+        finish(nil, nil, reason or "cancelled")
+        UIManager:scheduleIn(0.2, function() cleanup(); os.remove(audio_file) end)
     end
-    return nil
+    self._fallback_jobs[audio_file] = cancel
+    local function poll()
+        if finished then return end
+        local done = io.open(done_path, "r")
+        if not done then
+            if time.now() < deadline then UIManager:scheduleIn(0.05, poll); return end
+            cancel("timeout"); return
+        end
+        local result = tonumber(done:read("*a"))
+        done:close()
+        if result ~= 0 then os.remove(audio_file); finish(nil); return end
+        local f = io.open(audio_file, "r")
+        if f then
+            f:close()
+            -- Smooth boundary clicks at start/end.
+            WavUtils.applyFade(audio_file, 15)
+            local target_sr = self._piper_sample_rate or 22050
+            if target_sr ~= 22050 then
+                WavUtils.resampleFile(audio_file, target_sr)
+            end
+            local saved_timing = self.timing_data
+            self:generateTimingEstimates(text)
+            local timing = self.timing_data
+            self.timing_data = saved_timing
+            finish(audio_file, timing)
+            return
+        end
+        finish(nil)
+    end
+    UIManager:scheduleIn(0.05, poll)
+    return true
 end
 --[[--
 Merge multiple WAV files into the current audio file.
@@ -2088,6 +2129,8 @@ function TTSEngine:prefetch(text, use_espeak)
         self._piper:enqueue(text)
         return true  -- launched (or already in queue)
     end
+    -- Don't launch duplicate async espeak work while this slot is pending.
+    if self._fallback_prefetch_pending == text then return true end
     -- Don't prefetch the same text twice
     if self._prefetch_text == text and self._prefetch_file then
         return true
@@ -2102,14 +2145,20 @@ function TTSEngine:prefetch(text, use_espeak)
         -- espeak session fallback (Piper abandoned): pre-synthesize the
         -- next fallback sentence while the current one plays, so the chain
         -- does not stall on blocking synthesis between sentences (#49).
-        local fb_file = self:espeakSynthesizeFallback(text)
-        ok = fb_file ~= nil
-        if ok then
-            self._prefetch_file = self.current_audio_file
-            self._prefetch_timing = self.timing_data
-            self._prefetch_text = text
-            logger.dbg("TTSEngine: Prefetched espeak fallback for:", text:sub(1, 40))
-        end
+        local generation = self._fallback_prefetch_generation or 0
+        self._fallback_prefetch_pending = text
+        ok = self:espeakSynthesizeFallbackAsync(text, function(file, timing)
+            if generation ~= (self._fallback_prefetch_generation or 0) then
+                if file then os.remove(file) end
+                return
+            end
+            self._fallback_prefetch_pending = nil
+            if file then
+                self._prefetch_file = file
+                self._prefetch_timing = timing
+                self._prefetch_text = text
+            end
+        end)
     else
         ok = self:synthesizeCommand(text, function(success, timing)
             if success then
@@ -2476,6 +2525,8 @@ end
 Clean up prefetch state.
 --]]
 function TTSEngine:_cleanPrefetch()
+    self._fallback_prefetch_generation = (self._fallback_prefetch_generation or 0) + 1
+    self._fallback_prefetch_pending = nil
     if self._prefetch_file then
         if not self._prefetch_in_use then
             os.remove(self._prefetch_file)
@@ -4448,14 +4499,8 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             end
             self.play_generation = (self.play_generation or 0) + 1
             local my_gen = self.play_generation
-            if not ao:isRunning() then
-                local ok_start = ao:start()
-                if not ok_start then
-                    logger.warn("TTSEngine: audioout daemon did not start; falling back")
-                    self._audioout_active = nil
-                    if on_fail then on_fail() end
-                    return false
-                end
+            local function still_current()
+                return self.play_generation == my_gen and self.is_speaking
             end
             local play_opts = { rate = self._target_sample_rate or 22050, channels = 1 }
             if self.audio_player_type == "bluealsa" then
@@ -4467,13 +4512,8 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                     play_opts.alsa_device = "plug:" .. bt:getBluealsaDevice(addr)
                 end
             end
-            local resp = ao:play(self.current_audio_file, play_opts)
-            if resp and not resp.ok and resp.error == "queue full" then
-                -- Stale clips from a dead previous group: drop and retry once.
-                logger.warn("TTSEngine: audioout queue full; flushing and retrying")
-                ao:flush()
-                resp = ao:play(self.current_audio_file, play_opts)
-            end
+            local function played(resp)
+            if not still_current() then return end
             if not resp or not resp.ok then
                 logger.warn("TTSEngine: audioout play refused:",
                     resp and resp.error or "timeout")
@@ -4485,11 +4525,17 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             -- The completion poll compares the daemon's done_count against
             -- the value at queue time; a stale or missing baseline here
             -- made every later group complete the moment it was queued.
-            self._audioout_done_baseline = resp.done_count
-            if not self._audioout_done_baseline then
-                local bst = self._audioout_client:status(400)
-                self._audioout_done_baseline = (bst and bst.done_count) or 0
+            -- The bundled daemon supplies a baseline in its play response.
+            -- A missing baseline is unsafe: a cached status may belong to an
+            -- earlier clip and falsely complete the new one.
+            if resp.done_count == nil then
+                self.is_speaking = false
+                if on_fail then on_fail() end
+                return
             end
+            self._audioout_done_baseline = resp.done_count
+            ao._status_epoch = (ao._status_epoch or 0) + 1
+            ao._status_cache, ao._status_time, ao._status_requested_at = nil, nil, nil
             self._audioout_start_ms = resp.start_ms or 0
             self._audioout_fed_end_ms = resp.fed_end_ms
             self._audio_launched_at = UIManager:getTime()
@@ -4502,6 +4548,8 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                 self._expected_play_duration_ms, "ms, start_ms=",
                 self._audioout_start_ms, "fed_end_ms=", self._audioout_fed_end_ms,
                 "gen=", my_gen, "piper_q=", self:getPiperQueueSnapshot())
+            -- Pause can be requested while asynchronous startup is pending.
+            if self.is_paused then ao:commandAsync({ cmd = "pause" }, 1000) end
             self:startTimingLoop()
             local engine = self
             local stall_since_ms = nil
@@ -4526,7 +4574,7 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                 -- the UI a bounded number of half-second stalls, never an
                 -- unresponsive device.
                 local st = engine._audioout_client
-                    and engine._audioout_client:status(500)
+                    and engine._audioout_client:statusCached(500)
                 if not st then
                     status_failures = status_failures + 1
                     if status_failures >= 8 then
@@ -4549,7 +4597,7 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                     -- into the legacy path, whose premature-exit detection
                     -- and BT messaging were built for this case.
                     logger.warn("TTSEngine: audioout sink unpaced (dead BT link?); failing")
-                    engine._audioout_client:stop()
+                    engine._audioout_client:commandAsync({ cmd = "stop" }, 1000)
                     engine.is_speaking = false
                     if on_fail then on_fail() end
                     return
@@ -4589,6 +4637,32 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             end
             engine._completion_timer_fn = pollAudiooutCompletion
             UIManager:scheduleIn(0.3, pollAudiooutCompletion)
+            end -- played: all launch work below yields to the UI event loop
+            local audio_path = self.current_audio_file
+            local function queue_play(retried)
+                if not still_current() then return end
+                self._audioout_pending_cancel = ao:commandAsync({ cmd = "play", path = audio_path, gap_ms = 0,
+                    rate = play_opts.rate, channels = play_opts.channels,
+                    alsa_device = play_opts.alsa_device }, 8000, function(resp)
+                    self._audioout_pending_cancel = nil
+                    if not still_current() then return end
+                    if resp and not resp.ok and resp.error == "queue full" and not retried then
+                        self._audioout_pending_cancel = ao:commandAsync({ cmd = "flush" }, 8000, function(flushed)
+                            self._audioout_pending_cancel = nil
+                            if not still_current() then return end
+                            if flushed and flushed.ok then queue_play(true)
+                            else played(nil) end
+                        end)
+                    else
+                        played(resp)
+                    end
+                end)
+            end
+            self._audioout_active = true -- stop() must also cancel a pending launch
+            ao:startAsync(function(ok)
+                if not still_current() then return end
+                if ok then queue_play(false) else played(nil) end
+            end, still_current)
             return true
         end
         -- fall through to the legacy gst-bt path on session fallback
@@ -6919,7 +6993,7 @@ function TTSEngine:pause()
             os.execute("lipc-set-prop com.lab126.playermgr Pause '' 2>/dev/null")
         -- audioout daemon: same feeder-silence semantics, owned in C.
         elseif self._audioout_active and self._audioout_client then
-            self._audioout_client:pause()
+            self._audioout_client:commandAsync({ cmd = "pause" }, 1000)
             logger.warn("TTSEngine: Paused audioout (daemon feeds silence)")
         -- Ask the feeder to stop writing the clip and feed silence instead.
         -- Never SIGSTOP gst-launch: freezing it stops the PCM flow into the
@@ -6958,7 +7032,7 @@ function TTSEngine:resume()
             os.execute("lipc-set-prop com.lab126.playermgr Play '' 2>/dev/null")
         -- audioout daemon: resume feeding at the exact clip offset.
         elseif self._audioout_active and self._audioout_client then
-            self._audioout_client:resume()
+            self._audioout_client:commandAsync({ cmd = "resume" }, 1000)
             logger.warn("TTSEngine: Resumed audioout, pause was",
                 pause_ms, "ms, total_pause=", self._total_pause_ms, "ms")
         -- Clear the pause flag: the feeder resumes the clip where it stopped
@@ -6978,6 +7052,14 @@ end
 Stop playback.
 --]]
 function TTSEngine:stop()
+    -- Cancel requests which have not yet reached the daemon before stopping it.
+    local cancel_launch = self._audioout_pending_cancel
+    self._audioout_pending_cancel = nil
+    self.play_generation = (self.play_generation or 0) + 1
+    if cancel_launch then cancel_launch() end
+    local jobs = {}
+    for _, cancel in pairs(self._fallback_jobs or {}) do jobs[#jobs + 1] = cancel end
+    for _, cancel in ipairs(jobs) do cancel() end
     -- Always bump generation and clear state, even if not speaking.
     -- This ensures stale scheduled callbacks (launchAndStart, checkProcess,
     -- updateTiming) exit immediately regardless of what state we were in.
@@ -7044,9 +7126,15 @@ function TTSEngine:stop()
     -- daemon process itself stays up for reuse; it is killed via
     -- forceKillAll/plugin teardown.
     if self._audioout_active and self._audioout_client then
-        self._audioout_client:stop()
-        self._audioout_client:release()
-        logger.warn("TTSEngine: audioout queue dropped, pipeline released")
+        local ao = self._audioout_client
+        local generation = self.play_generation
+        ao:commandAsync({ cmd = "stop" }, 1000, function()
+            -- A new play request may have arrived while stop was acknowledged.
+            if self.play_generation == generation and not self.is_speaking then
+                ao:release()
+            end
+        end)
+        logger.warn("TTSEngine: audioout stop/release scheduled")
     end
 
     
