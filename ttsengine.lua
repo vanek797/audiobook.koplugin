@@ -839,6 +839,19 @@ function TTSEngine:_invalidateHTTPLookahead()
     if self._http and self._http.plan then self._http:plan({}, 0) end
 end
 
+-- The existing merge/gap writer expects a canonical 44-byte PCM16 mono WAV.
+-- Refuse to batch other valid WAV layouts rather than corrupt their headers.
+function TTSEngine:_httpConcatFormat(path)
+    local file = path and io.open(path, "rb")
+    if not file then return nil end
+    local header = file:read(44) or ""
+    file:close()
+    if #header ~= 44 or header:sub(1, 4) ~= "RIFF" or header:sub(9, 16) ~= "WAVEfmt "
+        or header:sub(17, 24) ~= string.char(16, 0, 0, 0, 1, 0, 1, 0)
+        or header:sub(35, 40) ~= string.char(16, 0) .. "data" then return nil end
+    return header:sub(21, 36)
+end
+
 function TTSEngine:_httpSoftwareVolume()
     return self.backend == self.BACKENDS.PIPER_HTTP and self.plugin
         and not self.plugin:getSetting("audioout_enabled", true)
@@ -2529,7 +2542,16 @@ _cleanPrefetch() when the file is no longer needed.
 @return number      Duration in ms
 --]]
 function TTSEngine:peekPrefetch(text)
-    if self.backend == self.BACKENDS.PIPER_HTTP then return nil end
+    if self.backend == self.BACKENDS.PIPER_HTTP then
+        local path = self._http and self._http:peek(self:_httpOptions(text))
+        local format = path and self:_httpConcatFormat(path)
+        if not format or format ~= self:_httpConcatFormat(self.current_audio_file) then return nil end
+        local saved = self.timing_data
+        self:generateTimingEstimates(text)
+        local timing = self.timing_data
+        self.timing_data = saved
+        return path, timing, WavUtils.getDurationMs(path)
+    end
     -- Check single-slot prefetch (espeak-ng)
     if self._prefetch_file and self._prefetch_text == text then
         local dur = self:getWavDurationMs(self._prefetch_file)
@@ -7484,7 +7506,12 @@ end
 -- Thin delegates — keep the public API surface unchanged for synccontroller
 function TTSEngine:piperPrefetchAsync(text)     self._piper:enqueue(text) end
 function TTSEngine:_launchNextPiperPrefetch()    self._piper:launchNext() end
-function TTSEngine:consumePiperQueueEntry(text)  return self._piper:consume(text) end
+function TTSEngine:consumePiperQueueEntry(text)
+    if self.backend == self.BACKENDS.PIPER_HTTP then
+        return self._http and self._http:consume(self:_httpOptions(text))
+    end
+    return self._piper:consume(text)
+end
 function TTSEngine:getPiperPrefetchStatus(text)  return self._piper:getStatus(text) end
 
 --[[--

@@ -703,6 +703,7 @@ function SyncController:_beginReadingParsed(text, created_bar, keep_text)
     self._empty_skip_advances = 0
     self.total_sentences = #self.parsed_data.sentences
     self.reading_sentence_idx = 0
+    self._http_group_end_idx = nil
     self._chain_generation = (self._chain_generation or 0) + 1
     self._highest_dispatched_idx = nil
     self:_ttsResetClock()
@@ -1384,9 +1385,11 @@ function SyncController:beginSentencePlayback(sentence)
     local concat_sentences = {}      -- sentence objects (N+1, N+2, …)
     local concat_split_points = {}   -- cumulative-ms boundaries for the sync loop
     local concat_wav_files = {}      -- WAV paths to clean up later
+    local is_http = self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER_HTTP
+    local http_gap_padded = false
 
     if self.parsed_data and self.tts_engine.audio_player_type == "gst-bt"
-        and self.tts_engine.backend ~= self.tts_engine.BACKENDS.PIPER_HTTP then
+        and (not is_http or self.tts_engine:_httpConcatFormat(self.tts_engine.current_audio_file)) then
         local synth_t0 = UIManager:getTime()
         local first_dur = self.tts_engine:getAudioDurationMs()
         local cumulative_ms = first_dur
@@ -1415,6 +1418,7 @@ function SyncController:beginSentencePlayback(sentence)
         local first_padded = false
 
         for idx = self.reading_sentence_idx + 1, self.total_sentences do
+            if is_http and #concat_sentences >= 4 then break end -- at most five sentences per HTTP block
             local sent = self.parsed_data.sentences[idx]
             if not sent or not sent.text or sent.text == "" then
                 break
@@ -1426,8 +1430,8 @@ function SyncController:beginSentencePlayback(sentence)
             -- trailing-gap code after the loop handles the final padding.
             local pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
             if not pf_file then
-                if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS then
-                    logger.warn("SyncController: Concat: Piper sentence", idx, "not ready yet, stopping concat")
+                if is_http or self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS then
+                    logger.warn("SyncController: Concat: queued sentence", idx, "not ready yet, stopping concat")
                     break
                 end
                 self.tts_engine:prefetch(sent.text)
@@ -1542,6 +1546,7 @@ function SyncController:beginSentencePlayback(sentence)
         end
         -- Store trailing gap so play() can log it for diagnostics.
         self.tts_engine._trailing_gap_ms = trailing_gap_ms
+        http_gap_padded = is_http
 
         if #concat_files == 0 then concat_files = nil end
 
@@ -1666,7 +1671,7 @@ function SyncController:beginSentencePlayback(sentence)
             -- minimal UIManager delay so the next sentence starts right
             -- after the padded silence finishes playing.
             local is_neural = controller.tts_engine
-                and (controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER or controller.tts_engine.backend == controller.tts_engine.BACKENDS.SANOTTS)
+                and (http_gap_padded or controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER or controller.tts_engine.backend == controller.tts_engine.BACKENDS.SANOTTS)
             local delay = 0.2
             if is_neural then
                 -- Gap always padded into audio for Piper — minimal scheduling delay
@@ -1742,6 +1747,11 @@ function SyncController:beginSentencePlayback(sentence)
 
         -- Track how many sentences are in this play() for progress reporting
         self._sentences_in_play = sentences_in_play
+        if is_http then
+            self._http_group_end_idx = self.reading_sentence_idx + #concat_sentences
+            logger.warn("SyncController: HTTP playback block", self.reading_sentence_idx,
+                "through", self._http_group_end_idx, "sentences=", sentences_in_play)
+        end
 
         if #concat_sentences > 0 then
             self._concat_sentences = concat_sentences
@@ -1750,16 +1760,18 @@ function SyncController:beginSentencePlayback(sentence)
             self._concat_wav_files = concat_wav_files
             -- For Piper: schedule prefetch for sentences BEYOND the concat
             -- batch so they'll be ready when this concat stream finishes.
-            if self.tts_engine and (self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS)
+            if is_http then
+                self:planHTTPAhead()
+            elseif self.tts_engine and (self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS)
                     and not self._piper_abandoned then
                 local last_concat_idx = self.reading_sentence_idx + #concat_sentences
                 for offset = 1, PIPER_LOOKAHEAD do
                     self:_prefetchNextSentence(last_concat_idx + offset)
                 end
             end
-            -- Schedule next-page prefetch in background so it's ready
-            -- when we finish all sentences on this page.
-            self:_prefetchNextPage()
+            -- HTTP's queue is page-bounded. Do not peek/re-render the next
+            -- page for every small block; its final boundaries handle that.
+            if not is_http then self:_prefetchNextPage() end
         else
             self._concat_sentences = nil
             self._concat_split_points = nil
@@ -1837,7 +1849,8 @@ function SyncController:planHTTPAhead()
     count = math.max(0, math.min(8, math.floor(tonumber(count) or 3)))
     local texts = {}
     if self.parsed_data then
-        for i = self.reading_sentence_idx + 1, math.min(self.total_sentences, self.reading_sentence_idx + count) do
+        local after = math.max(self.reading_sentence_idx, self._http_group_end_idx or 0)
+        for i = after + 1, math.min(self.total_sentences, after + count) do
             local sentence = self.parsed_data.sentences[i]
             if sentence and sentence.text and sentence.text ~= "" then texts[#texts + 1] = sentence.text end
         end
@@ -2697,7 +2710,9 @@ function SyncController:startSentenceSyncLoop(sentence)
                     self.playback_bar:updateProgress(self:getProgress())
                 end
                 -- When we reach the last 2 sentences, trigger next-page prefetch
-                if bi >= #self._concat_sentences - 1 and not self._next_page_prefetched then
+                if bi >= #self._concat_sentences - 1 and not self._next_page_prefetched
+                    and (self.tts_engine.backend ~= self.tts_engine.BACKENDS.PIPER_HTTP
+                        or (self._http_group_end_idx or 0) >= self.total_sentences - 1) then
                     self:_prefetchNextPage()
                 end
             end
@@ -3268,6 +3283,7 @@ function SyncController:stop(opts)
     end
     self.state = self.STATE.STOPPED
     self._http_volume_dirty = false
+    self._http_group_end_idx = nil
 
     -- Cancel any pending next-sentence timer so a stale closure cannot
     -- fire after stop (or worse, after a *new* session has started).

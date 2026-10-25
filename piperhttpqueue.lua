@@ -120,6 +120,35 @@ function Queue:plan(options_list, limit)
     self:_pump()
 end
 
+-- Borrow a ready WAV for block planning, without waiting or starting HTTP.
+function Queue:peek(options)
+    local key = Queue.key(options)
+    local entry = self.entries[key]
+    if not (entry and entry.path) then return nil end
+    local file = io.open(entry.path, "rb")
+    local intact = file and file:seek("end") == entry.size
+    if file then file:close() end
+    if not intact then self:_drop(key); return nil end
+    return entry.path
+end
+
+-- Transfer a cached file to a playback block. Cache cleanup must not delete
+-- it afterwards. No network work is launched while the block is assembled.
+function Queue:consume(options)
+    local path = self:peek(options)
+    if not path then return nil end
+    local key = Queue.key(options)
+    local entry = self.entries[key]
+    self.entries[key] = nil
+    self.bytes = self.bytes - entry.size
+    self.wanted[key] = nil
+    for i = #self.order, 1, -1 do
+        if self.order[i] == key then table.remove(self.order, i) end
+    end
+    self.hits = self.hits + 1
+    return path
+end
+
 -- Use a ready WAV; promote an in-flight prefetch of the same phrase; otherwise
 -- cancel a lower-priority prefetch so the current sentence never waits behind N.
 function Queue:request(options, callback)

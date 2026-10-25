@@ -74,11 +74,32 @@ zero clears speculation without interrupting an active foreground request.
 
 The window currently covers the parsed page, including any existing wrapped
 sentence. It is replenished after page transitions; it does not pre-render the
-whole book. This caches individual WAVs, not a concatenated stream: Bluetooth
-startup/page-transition gaps may remain. Word timing is estimated and scaled
-to WAV duration, not server-provided alignment. A failed foreground request
-stops read-aloud and shows an error rather than silently skipping content or
-switching to a local synthesizer.
+whole book. Word timing is estimated and scaled to WAV duration, not
+server-provided alignment. A failed foreground request stops read-aloud and
+shows an error rather than silently skipping content or switching to a local
+synthesizer.
+
+### Playback blocks on Kobo MTK / legacy gst-bt
+
+Ready adjacent sentences are merged into one canonical PCM16 mono WAV before
+launching the legacy Bluetooth player. A block includes at most five sentences;
+additional sentences are not included if their combined audio would exceed the
+existing 30-second concat threshold. A single long sentence is not truncated.
+This removes per-sentence GStreamer/Bluetooth restarts **inside** a ready block
+without re-enabling audioout. Configured sentence/paragraph silence is padded
+once, and word/sentence boundaries use the existing concat timing machinery.
+
+Assembly only borrows already-ready WAVs: it never waits for HTTP or synthesizes
+in the UI. A miss starts the available sentence/block immediately. Lookahead
+then starts after the last sentence in that block, not after its first sentence.
+The cache transfers file ownership to block cleanup; a cache reset cannot delete
+files which the player is using. Different sample rates/formats or noncanonical
+headers are not merged. Other audio-player paths retain single-file playback.
+
+The first sentence may start before any lookahead is ready. Player-startup gaps
+can remain between blocks and on page transitions; this is not a persistent or
+fully gapless streaming player. Logs include `HTTP playback block` and its
+sentence range so actual on-reader grouping can be checked.
 
 ### Volume with audioout disabled
 
@@ -111,6 +132,7 @@ Host checks (LuaJIT):
 ```sh
 luajit dev/test_piper_http.lua
 luajit dev/test_piper_http_queue.lua
+luajit dev/test_piper_http_blocks.lua
 luajit dev/test_piper_http_menu.lua
 luajit dev/test_piper_http_volume.lua
 luajit dev/test_audioout_deadline.lua
@@ -128,4 +150,6 @@ make the server unreachable, and enter USB mode after stopping. Test N=0, 3,
 and 8, immediate stop while prefetching, changes to voice/rate/volume, and page
 transitions. Confirm no text is silently skipped and local engines remain
 selectable. Host queue tests use a controlled fake worker; cache behavior on
-physical Kobo still requires this acceptance test.
+physical Kobo still requires this acceptance test. Block tests exercise actual
+WAV merging and controller completion/ownership with a fake audio player; verify
+the audible gaps and real Bluetooth startup on the reader after installation.
