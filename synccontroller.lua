@@ -1385,7 +1385,8 @@ function SyncController:beginSentencePlayback(sentence)
     local concat_split_points = {}   -- cumulative-ms boundaries for the sync loop
     local concat_wav_files = {}      -- WAV paths to clean up later
 
-    if self.parsed_data and self.tts_engine.audio_player_type == "gst-bt" then
+    if self.parsed_data and self.tts_engine.audio_player_type == "gst-bt"
+        and self.tts_engine.backend ~= self.tts_engine.BACKENDS.PIPER_HTTP then
         local synth_t0 = UIManager:getTime()
         local first_dur = self.tts_engine:getAudioDurationMs()
         local cumulative_ms = first_dur
@@ -1830,7 +1831,25 @@ finishes, the next one's WAV is already on disk.
 @param explicit_idx number|nil  If provided, prefetch this sentence index
                                 instead of reading_sentence_idx + 1.
 --]]
+function SyncController:planHTTPAhead()
+    if not self.tts_engine or self.tts_engine.backend ~= self.tts_engine.BACKENDS.PIPER_HTTP then return end
+    local count = self.plugin and self.plugin:getSetting("piper_http_lookahead", 3) or 3
+    count = math.max(0, math.min(8, math.floor(tonumber(count) or 3)))
+    local texts = {}
+    if self.parsed_data then
+        for i = self.reading_sentence_idx + 1, math.min(self.total_sentences, self.reading_sentence_idx + count) do
+            local sentence = self.parsed_data.sentences[i]
+            if sentence and sentence.text and sentence.text ~= "" then texts[#texts + 1] = sentence.text end
+        end
+    end
+    self.tts_engine:prefetchHTTPSentences(texts, count)
+end
+
 function SyncController:_prefetchNextSentence(explicit_idx)
+    if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER_HTTP then
+        self:planHTTPAhead()
+        return
+    end
     local next_idx = explicit_idx or (self.reading_sentence_idx + 1)
     if not self.parsed_data or next_idx > self.total_sentences then
         return -- nothing to prefetch

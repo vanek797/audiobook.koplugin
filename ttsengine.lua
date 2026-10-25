@@ -659,6 +659,9 @@ Set speech rate.
 function TTSEngine:setRate(rate)
     local old = self.rate or 1.0
     self.rate = math.max(0.25, math.min(2.0, rate))
+    if self.backend == self.BACKENDS.PIPER_HTTP and old ~= self.rate then
+        self:_invalidateHTTPLookahead()
+    end
     logger.dbg("TTSEngine: Rate set to", self.rate)
     -- Piper and sanoTTS bake the rate into the server command line, so a
     -- running server keeps the old speed until it restarts.  Pass the old
@@ -680,7 +683,11 @@ Set speech volume.
 @param volume number Volume level (0.0 to 1.0)
 --]]
 function TTSEngine:setVolume(volume)
+    local previous = self.volume
     self.volume = math.max(0.0, math.min(1.0, volume))
+    if previous ~= self.volume and self:_httpSoftwareVolume() then
+        self:_invalidateHTTPLookahead()
+    end
     -- audioout daemon applies volume live on the volume element: no
     -- pipeline rebuild, unlike the gst-bt path (the whole point of
     -- owning the output).
@@ -770,24 +777,17 @@ end
 
 -- HTTP synthesis is intentionally independent of the local Piper queue.
 function TTSEngine:_synthesizeHTTP(text, callback)
-    if not self._http then
-        self._http = dofile(_utils_dir .. "piperhttp.lua"):new()
-    end
+    self:_httpQueue()
     local generation = self._http_generation or 0
     local function failed(reason)
         self._http_error = tostring(reason)
         logger.warn("TTSEngine: Piper HTTP:", self._http_error)
         if callback then callback(false, nil) end
     end
-    local plugin = self.plugin
     local software_volume = self:_httpSoftwareVolume()
-    local gain = software_volume and self.volume or 1
-    local started, err = self._http:request({
-        url = plugin and plugin:getSetting("piper_http_url", "") or "",
-        voice = plugin and plugin:getSetting("piper_http_voice", "ru_RU-irina-medium") or nil,
-        timeout = plugin and plugin:getSetting("piper_http_timeout", 30) or 30,
-        text = text, rate = self.rate, volume = gain,
-    }, function(path, reason)
+    local options = self:_httpOptions(text)
+    local gain = options.volume
+    local started, err = self._http:request(options, function(path, reason)
         if generation ~= (self._http_generation or 0) or self.backend ~= self.BACKENDS.PIPER_HTTP then
             if path then os.remove(path) end
             return
@@ -805,6 +805,38 @@ function TTSEngine:_synthesizeHTTP(text, callback)
     -- Errors are already delivered through the callback; do not dispatch a
     -- second failure from SyncController's immediate-false branch.
     return true
+end
+
+function TTSEngine:_httpQueue()
+    if not self._http then
+        local Client = dofile(_utils_dir .. "piperhttp.lua")
+        local Queue = dofile(_utils_dir .. "piperhttpqueue.lua")
+        self._http = Queue:new{ client = Client:new() }
+    end
+    return self._http
+end
+
+function TTSEngine:_httpOptions(text)
+    local plugin = self.plugin
+    return {
+        url = plugin and plugin:getSetting("piper_http_url", "") or "",
+        voice = plugin and plugin:getSetting("piper_http_voice", "ru_RU-irina-medium") or nil,
+        timeout = plugin and plugin:getSetting("piper_http_timeout", 30) or 30,
+        text = text, rate = self.rate,
+        volume = self:_httpSoftwareVolume() and self.volume or 1,
+    }
+end
+
+function TTSEngine:prefetchHTTPSentences(texts, limit)
+    if self.backend ~= self.BACKENDS.PIPER_HTTP then return false end
+    local options = {}
+    for _, text in ipairs(texts) do options[#options + 1] = self:_httpOptions(text) end
+    self:_httpQueue():plan(options, limit)
+    return true
+end
+
+function TTSEngine:_invalidateHTTPLookahead()
+    if self._http and self._http.plan then self._http:plan({}, 0) end
 end
 
 function TTSEngine:_httpSoftwareVolume()
@@ -2125,8 +2157,8 @@ so when the current sentence finishes we can skip straight to playback.
 @return boolean Success
 --]]
 function TTSEngine:prefetch(text, use_espeak)
-    -- First version: one cancellable HTTP request at a time. Never launch a
-    -- speculative local synth or overwrite the playing sentence's state.
+    -- HTTP lookahead has its own bounded queue (prefetchHTTPSentences).
+    -- Never use the local synthesizer or overwrite the playing WAV here.
     if self.backend == self.BACKENDS.PIPER_HTTP then return false end
     if not self.backend or not text or text == "" then
         return false

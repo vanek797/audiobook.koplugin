@@ -408,6 +408,13 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
             end,
             sub_item_table_func = function() return MenuBuilder.buildHTTPVoiceMenu(plugin) end,
         })
+        table.insert(menu, {
+            text_func = function()
+                return T(_("Cache ahead: %1 sentences"), plugin:getSetting("piper_http_lookahead", 3))
+            end,
+            sub_item_table_func = function() return MenuBuilder.buildHTTPAheadMenu(plugin) end,
+            help_text = _("Download upcoming sentences while the current one plays. 0 disables lookahead. One HTTP request at a time; up to 32 MiB of cached audio."),
+        })
     elseif plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.PIPER then
         table.insert(menu, {
             text_func = function()
@@ -1110,6 +1117,24 @@ function MenuBuilder.buildHTTPVoiceMenu(plugin)
                 plugin:setSetting("piper_http_voice", id)
             end,
         })
+    end
+    return menu
+end
+
+function MenuBuilder.buildHTTPAheadMenu(plugin)
+    local menu = {}
+    for value = 0, 8 do
+        local count = value
+        menu[#menu + 1] = {
+            text = count == 0 and _("Disabled") or tostring(count),
+            checked_func = function() return plugin:getSetting("piper_http_lookahead", 3) == count end,
+            callback = function()
+                plugin:setSetting("piper_http_lookahead", count)
+                if plugin.sync_controller and plugin.sync_controller.planHTTPAhead then
+                    plugin.sync_controller:planHTTPAhead()
+                end
+            end,
+        }
     end
     return menu
 end
