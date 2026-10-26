@@ -31,10 +31,18 @@ input='http://piper.test/invalid';dialog.buttons[1][2].callback()
 assert(settings.piper_http_url=='http://piper.test:5000' and closed==1 and stops==1 and shown.text)
 print('PASS invalid server URL does not replace the saved setting')
 local voices=M.buildHTTPVoiceMenu(plugin)
-assert(#voices==3 and voices[1].checked_func())
+assert(#voices==6 and voices[1].checked_func())
 voices[2].callback();assert(settings.piper_http_voice=='en_US-amy-medium' and voices[2].checked_func())
 voices[3].callback();assert(settings.piper_http_voice=='de_DE-ramona-low' and voices[3].checked_func())
-print('PASS each female voice menu callback persists its own voice id')
+local expected={'ru_RU-irina-medium','en_US-amy-medium','de_DE-ramona-low',
+    'en_US-lessac-medium','en_US-lessac-high','en_US-libritts-high'}
+for i,id in ipairs(expected)do
+    local before=stops
+    voices[i].callback()
+    assert(settings.piper_http_voice==id and voices[i].checked_func() and stops==before+1)
+    for j,item in ipairs(voices)do assert(item.checked_func()==(i==j))end
+end
+print('PASS all six voice callbacks save the correct id, stop old audio, and update selection')
 input='';dialog.buttons[1][2].callback();assert(settings.piper_http_url=='')
 print('PASS URL can be cleared without restoring any implicit server')
 f=assert(io.open(root..'package-for-kobo.sh'));source=f:read('*a');f:close()

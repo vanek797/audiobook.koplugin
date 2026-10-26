@@ -5,6 +5,9 @@ PiperHTTP.VOICES = {
     { id = "ru_RU-irina-medium", label = "Irina — Russian (medium)" },
     { id = "en_US-amy-medium", label = "Amy — English (medium)" },
     { id = "de_DE-ramona-low", label = "Ramona — German (low)" },
+    { id = "en_US-lessac-medium", label = "Lessac — English (medium)" },
+    { id = "en_US-lessac-high", label = "Lessac — English (high)" },
+    { id = "en_US-libritts-high", label = "LibriTTS — English (high, default speaker)" },
 }
 PiperHTTP.MAX_AUDIO_BYTES = 16 * 1024 * 1024
 

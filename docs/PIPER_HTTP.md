@@ -14,6 +14,9 @@ espeak, and sanoTTS remain separate engine choices.
    - `ru_RU-irina-medium` (Russian female, medium)
    - `en_US-amy-medium` (US English female, medium)
    - `de_DE-ramona-low` (German female, low)
+   - `en_US-lessac-medium` (US English, medium)
+   - `en_US-lessac-high` (US English, high)
+   - `en_US-libritts-high` (US English, high; server default speaker)
 6. Choose **Reading mode**: **Sentences** (default) or **Page + next page** (experimental).
 7. In sentence mode, choose **Cache ahead** (0–8 sentences; default 3). Zero disables sentence lookahead. Page mode instead prepares exactly one next page.
 8. Start read-aloud normally.
@@ -39,6 +42,9 @@ Settings are stored under `audiobook_settings`:
 
 Changing the address or voice stops the current reading session. Start playback
 again to apply it. Remote selection ignores the local espeak-only override.
+LibriTTS high contains 904 speakers, but this menu currently selects the model
+only: no `speaker_id` is sent, so Piper uses its default speaker. The new menu
+entries do not download models or change the saved voice automatically.
 
 ## Server contract
 
