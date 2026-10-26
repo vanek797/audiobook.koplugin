@@ -14,8 +14,9 @@ espeak, and sanoTTS remain separate engine choices.
    - `ru_RU-irina-medium` (Russian female, medium)
    - `en_US-amy-medium` (US English female, medium)
    - `de_DE-ramona-low` (German female, low)
-6. Choose **Cache ahead** (0–8 sentences; default 3). Zero disables lookahead.
-7. Start read-aloud normally.
+6. Choose **Reading mode**: **Sentences** (default) or **Page + next page** (experimental).
+7. In sentence mode, choose **Cache ahead** (0–8 sentences; default 3). Zero disables sentence lookahead. Page mode instead prepares exactly one next page.
+8. Start read-aloud normally.
 
 There is **no default server address**, discovery, or fallback server. An empty
 URL stops reading with an error. Save normalizes whitespace and trailing slashes.
@@ -31,7 +32,9 @@ Settings are stored under `audiobook_settings`:
 | `tts_backend` | existing engine | Set to `piper-http` by selecting the engine |
 | `piper_http_url` | empty | Edited with the on-reader keyboard |
 | `piper_http_voice` | `ru_RU-irina-medium` | Chosen in the voice menu |
-| `piper_http_timeout` | 30 | Request deadline in seconds, clamped to 5–120; advanced file setting |
+| `piper_http_mode` | `sentences` | On-reader choice: `sentences` or `page` |
+| `piper_http_timeout` | 30 | Sentence request deadline in seconds, clamped to 5–120; advanced file setting |
+| `piper_http_page_timeout` | 90 | Page request deadline in seconds, clamped to 5–120; advanced file setting |
 | `piper_http_lookahead` | 3 | Number of future parsed sentences to cache, editable on-device (0–8) |
 
 Changing the address or voice stops the current reading session. Start playback
@@ -101,14 +104,56 @@ can remain between blocks and on page transitions; this is not a persistent or
 fully gapless streaming player. Logs include `HTTP playback block` and its
 sentence range so actual on-reader grouping can be checked.
 
+### Whole-page audio + next-page preparation
+
+Page mode sends the complete normalized visible-page text in one request,
+without the local synthesizer's 300/1000-character chunk limits. The existing
+32768-byte text and 16 MiB WAV limits still apply: an oversized request fails
+explicitly rather than silently truncating the book. A page is one playback
+unit, including pages longer than the sentence block mode's 30-second cap.
+This is an **opt-in experimental mode**: long WAV playback still needs physical
+Kobo/Bluetooth validation; switch back to sentence mode if it is unstable.
+Natural pauses emitted by the model remain.
+
+While page audio plays, a deferred snapshot of the next view is normalized
+and queued through the same single-worker cache. There are no visible UI page
+turns for the snapshot; rolling page mode follows the visible page count and
+hidden-flow successors, while scrolling accounts for footer and overlap height.
+The original document view is restored even after extraction/navigation errors.
+If restoration fails or the active view changes unexpectedly, reading stops.
+
+The preview is only a cache hint. On automatic advance the **actual settled
+next-page text** is captured again; only an exact normalized text/cache-key
+match reuses its WAV. A wrong or incomplete preview causes a fresh request,
+never reading the wrong cached page. No next-page request is made when
+`auto_advance` is disabled. Page mode does not append the beginning of the next
+page to complete a sentence, or skip a prefix as if it had already been spoken.
+
+Word positions are retained and timings are estimated over the whole WAV,
+then scaled to its duration; they are not exact server alignments. Page-wide
+sentence highlighting is suppressed while word highlighting remains available.
+Progress is word-based. Volume/rate restarts and scrubbing request the remaining
+page starting at the current/selected word instead of repeating the page start.
+
+Manual page changes stop old page audio and cancel pending network work,
+including while loading. Restart read-aloud on the newly visible page. Rotation
+or a changed layout stops the session rather than trying to remap a whole-page
+utterance to differently split sentences. Paged EPUB view is recommended; scroll
+view's intentionally overlapping lines may be spoken again across view changes.
+
+This eliminates player restarts **inside** a page, not the Bluetooth startup
+gap between pages. Preview mismatches, slow synthesis, Wi-Fi loss, and page
+layout changes may still cause waits. The NAS/container API does not change.
+
 ### Volume with audioout disabled
 
 When `audioout_enabled` is false, the HTTP worker attenuates PCM16 WAV samples
 before returning audio to the player. This does not require GStreamer's volume
 element and avoids applying the same gain twice. Zero percent is digital silence.
-Changing volume while playing restarts the current sentence with the new gain;
-while loading it restarts the pending sentence. Adjusting a paused session does
-not resume it: the new gain applies when the user resumes. With audioout enabled,
+In sentence mode, changing volume while playing restarts the current sentence
+with the new gain; while loading it restarts the pending sentence. Page mode
+restarts the remaining page at the current word instead. Adjusting a paused
+session does not resume it: the new gain applies when the user resumes. With audioout enabled,
 the existing live daemon gain control remains in use.
 
 Moving synthesis to a server does not replace the reader's Bluetooth player or
@@ -119,7 +164,9 @@ fix every possible local audio/firmware failure.
 Back up the installed plugin first. The changed runtime files are:
 
 - `piperhttp.lua`
-- `piperhttpqueue.lua` (new lookahead queue)
+- `piperhttpqueue.lua` (lookahead queue)
+- `piperhttppage.lua` (whole-page preparation/view identity)
+- `main.lua` (safe preview and manual-view-change hook)
 - `ttsengine.lua`
 - `menubuilder.lua`
 - `synccontroller.lua`
@@ -133,6 +180,7 @@ Host checks (LuaJIT):
 luajit dev/test_piper_http.lua
 luajit dev/test_piper_http_queue.lua
 luajit dev/test_piper_http_blocks.lua
+luajit dev/test_piper_http_pages.lua
 luajit dev/test_piper_http_menu.lua
 luajit dev/test_piper_http_volume.lua
 luajit dev/test_audioout_deadline.lua
@@ -140,7 +188,8 @@ luajit dev/test_tts_kobo_safety.lua
 ```
 
 These are isolated/mocked backend, transport, menu, and audio-lifecycle checks.
-A separate live NAS probe verified HTTP synthesis returns WAV, but end-to-end
+Separate live NAS probes verified HTTP synthesis returns WAV, including a
+single page-sized request producing more than 30 seconds of audio, but end-to-end
 KOReader subprocess behavior, physical keyboard/menu, Bluetooth playback, close
 button, and USB teardown still require a real-reader acceptance test.
 
@@ -153,3 +202,8 @@ selectable. Host queue tests use a controlled fake worker; cache behavior on
 physical Kobo still requires this acceptance test. Block tests exercise actual
 WAV merging and controller completion/ownership with a fake audio player; verify
 the audible gaps and real Bluetooth startup on the reader after installation.
+For page mode also verify a long page, cached automatic advance, from-here
+reading, a wrong-preview cache miss, manual turning while loading, stop/USB,
+rotation, word-based seek, and volume/rate changes partway through the page.
+Host tests exercise real WAV parsing/merging and fake document/worker lifecycle,
+not the physical e-ink controller or Bluetooth hardware.

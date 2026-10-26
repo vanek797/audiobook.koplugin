@@ -3697,17 +3697,48 @@ function Audiobook:peekNextPageText()
     local document = self.ui.document
     local Screen = Device.screen
     self._peeking_adjacent_page = true
-    local text
+    local text, saved_pos, saved_page
     local ok, err = pcall(function()
         if self.ui.rolling then
-            local saved_pos = document:getCurrentPos()
-            local next_pos = saved_pos + Screen:getHeight()
-            document:gotoPos(next_pos)
+            saved_pos = document:getCurrentPos()
+            local view = self.ui.view or self.ui.rolling.view
+            if view and view.view_mode == "page" and document.gotoPage and document.getCurrentPage then
+                -- Mirror ReaderRolling:onGotoViewRel(1), without UI events.
+                saved_page = document:getCurrentPage()
+                local count = document.getVisiblePageNumberCount and document:getVisiblePageNumberCount() or 1
+                local next_page = saved_page
+                if document.hasHiddenFlows and document:hasHiddenFlows() and document.getNextPage then
+                    for _i = 1, count do
+                        local following = document:getNextPage(next_page)
+                        if following > 0 then next_page = following end
+                    end
+                else
+                    next_page = next_page + count
+                end
+                if next_page == saved_page then return end
+                document:gotoPage(next_page)
+                if document:getCurrentPage() <= saved_page then return end
+            else
+                local height = self.ui.dimen and self.ui.dimen.h or Screen:getHeight()
+                local footer = view and view.footer
+                if view and view.footer_visible and footer and not (footer.settings and footer.settings.reclaim_height) then
+                    height = height - footer:getHeight()
+                end
+                if view and view.page_overlap_enable then
+                    local config = self.ui.rolling.configurable
+                    if not config or not config.font_size or not config.line_spacing or not Screen.scaleBySize then return end
+                    local settings = rawget(_G, "G_reader_settings")
+                    local lines = settings and settings:readSetting("copt_overlap_lines") or 1
+                    local overlap = Screen:scaleBySize(config.font_size * 1.1 * config.line_spacing / 100) * lines
+                    if height > overlap then height = height - overlap end
+                end
+                document:gotoPos(saved_pos + height)
+                if document:getCurrentPos() <= saved_pos then return end
+            end
             local ok_res, res = pcall(document.getTextFromPositions, document,
                 {x = 0, y = 0},
                 {x = Screen:getWidth(), y = Screen:getHeight()},
                 true)
-            document:gotoPos(saved_pos)
             if ok_res and res and res.text and res.text ~= "" then
                 text = res.text
             end
@@ -3734,6 +3765,17 @@ function Audiobook:peekNextPageText()
             end
         end
     end)
+    -- Restore even if navigation/extraction throws. Never dispatch a UI page
+    -- turn for a preview, and keep the event guard set during restoration.
+    if saved_pos ~= nil then
+        local restored, restore_error
+        if saved_page ~= nil then
+            restored, restore_error = pcall(document.gotoPage, document, saved_page)
+        else
+            restored, restore_error = pcall(document.gotoPos, document, saved_pos)
+        end
+        if not restored then ok, err, text = false, restore_error, nil end
+    end
     self._peeking_adjacent_page = false
     if not ok then
         logger.warn("Audiobook: peekNextPageText failed:", err)
@@ -3881,6 +3923,7 @@ end
 function Audiobook:_dropTtsHighlightOnPageChange()
     local sc = self.sync_controller
     if not sc or not sc.STATE then return end
+    if sc.onHTTPPageViewChanged and sc:onHTTPPageViewChanged() then return end
     if sc.state == sc.STATE.STOPPED or sc.state == sc.STATE.LOADING then
         return
     end

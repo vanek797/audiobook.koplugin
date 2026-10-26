@@ -821,7 +821,9 @@ function TTSEngine:_httpOptions(text)
     return {
         url = plugin and plugin:getSetting("piper_http_url", "") or "",
         voice = plugin and plugin:getSetting("piper_http_voice", "ru_RU-irina-medium") or nil,
-        timeout = plugin and plugin:getSetting("piper_http_timeout", 30) or 30,
+        timeout = self:isHTTPPageMode()
+            and (plugin and plugin:getSetting("piper_http_page_timeout", 90) or 90)
+            or (plugin and plugin:getSetting("piper_http_timeout", 30) or 30),
         text = text, rate = self.rate,
         volume = self:_httpSoftwareVolume() and self.volume or 1,
     }
@@ -850,6 +852,11 @@ function TTSEngine:_httpConcatFormat(path)
         or header:sub(17, 24) ~= string.char(16, 0, 0, 0, 1, 0, 1, 0)
         or header:sub(35, 40) ~= string.char(16, 0) .. "data" then return nil end
     return header:sub(21, 36)
+end
+
+function TTSEngine:isHTTPPageMode()
+    return self.backend == self.BACKENDS.PIPER_HTTP and self.plugin
+        and self.plugin:getSetting("piper_http_mode", "sentences") == "page"
 end
 
 function TTSEngine:_httpSoftwareVolume()

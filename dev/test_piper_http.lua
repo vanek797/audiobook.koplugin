@@ -124,4 +124,17 @@ h.kill=function(pid)direct_kills=direct_kills+1;processes[pid].done=true end
 h:request(opts,function()error('cancelled callback')end);h:cancel()
 assert(direct_kills==1 and not h.job)
 print('PASS cancellation before child process-group setup kills the child PID')
-print('ALL 17 PIPER HTTP CHECKS PASSED')
+engine._http.request=function(_,o,cb)submitted=o;return true end
+settings.piper_http_mode='page'
+engine:_synthesizeHTTP('Whole page. Another sentence.',function()end)
+assert(submitted.text=='Whole page. Another sentence.' and submitted.timeout==90)
+settings.piper_http_mode='sentences'
+engine:_synthesizeHTTP('One sentence.',function()end);assert(submitted.timeout==30)
+print('PASS page mode uses a separate long-request timeout and preserves complete text')
+local full=assert(source:match('(function TTSEngine:synthesize%([^\n]+.-)\n%-%- HTTP synthesis'))
+setfenv(assert(loadstring(full)),env)()
+local complete=string.rep('Long page text. ',500);local received
+engine._synthesizeHTTP=function(_,value)received=value;return true end
+assert(engine:synthesize(complete,function()end) and received==complete)
+print('PASS HTTP pages bypass the local command-line text truncation')
+print('ALL 19 PIPER HTTP CHECKS PASSED')

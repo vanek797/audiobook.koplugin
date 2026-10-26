@@ -410,8 +410,20 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
         })
         table.insert(menu, {
             text_func = function()
+                return T(_("Reading mode: %1"), plugin:getSetting("piper_http_mode", "sentences") == "page"
+                    and _("Page + next page") or _("Sentences"))
+            end,
+            sub_item_table_func = function() return MenuBuilder.buildHTTPModeMenu(plugin) end,
+            help_text = _("Page mode sends the visible page as one request and prepares the next page while playing. Experimental on long pages: Bluetooth playback still needs testing. Word timing is estimated."),
+        })
+        table.insert(menu, {
+            text_func = function()
+                if plugin:getSetting("piper_http_mode", "sentences") == "page" then
+                    return _("Cache ahead: next page")
+                end
                 return T(_("Cache ahead: %1 sentences"), plugin:getSetting("piper_http_lookahead", 3))
             end,
+            enabled_func = function() return plugin:getSetting("piper_http_mode", "sentences") ~= "page" end,
             sub_item_table_func = function() return MenuBuilder.buildHTTPAheadMenu(plugin) end,
             help_text = _("Download upcoming sentences while the current one plays. 0 disables lookahead. One HTTP request at a time; up to 32 MiB of cached audio."),
         })
@@ -1117,6 +1129,27 @@ function MenuBuilder.buildHTTPVoiceMenu(plugin)
                 plugin:setSetting("piper_http_voice", id)
             end,
         })
+    end
+    return menu
+end
+
+function MenuBuilder.buildHTTPModeMenu(plugin)
+    local menu = {}
+    local choices = {
+        { id = "sentences", label = _("Sentences (bounded playback blocks)") },
+        { id = "page", label = _("Page + next page (experimental)") },
+    }
+    for _i, choice in ipairs(choices) do
+        local mode = choice.id
+        menu[#menu + 1] = {
+            text = choice.label,
+            checked_func = function() return plugin:getSetting("piper_http_mode", "sentences") == mode end,
+            callback = function(touchmenu)
+                stopForHTTPSettings(plugin)
+                plugin:setSetting("piper_http_mode", mode)
+                if touchmenu then touchmenu:closeMenu() end
+            end,
+        }
     end
     return menu
 end

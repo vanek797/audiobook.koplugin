@@ -150,4 +150,20 @@ check('noncanonical WAV headers are rejected by the block format gate',function(
     -- Only format gating is exercised: deliberately invalid data is not played.
     cleanup()
 end)
+check('whole-page mode plays a long page as one WAV without the block cap',function()
+    local sc,e,q,c,p,cleanup=fixture(60000,0,false)
+    local Page=dofile(root..'piperhttppage.lua')
+    local parser=dofile(root..'textparser.lua'):new()
+    sc.parsed_data=Page.parse(parser,'First sentence. Second sentence. Third sentence.')
+    sc.total_sentences=1
+    for i,word in ipairs(sc.parsed_data.words)do word.start_time=(i-1)*100;word.end_time=i*100;word.duration=100 end
+    sc.prefetchHTTPNextPage=function(self)
+        self.page_previews=(self.page_previews or 0)+1
+        e:prefetchHTTPSentences({'next page'},1)
+    end
+    sc:beginSentencePlayback(sc.parsed_data.sentences[1])
+    assert(e.play_calls==1 and not e.extra_files and W.getDurationMs(p.A)==60000)
+    assert(sc.page_previews==1 and c.active.options.text=='next page')
+    cleanup()
+end)
 print('ALL '..count..' PIPER HTTP BLOCK CHECKS PASSED')

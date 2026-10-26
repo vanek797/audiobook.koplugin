@@ -16,6 +16,7 @@ local T = require("ffi/util").template
 -- Shared utility modules (DRY: eliminates duplicated getPluginPath, ws)
 local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
 local Utils = dofile(_utils_dir .. "utils.lua")
+local HTTPPage = dofile(_utils_dir .. "piperhttppage.lua")
 local PLUGIN_PATH = _utils_dir
 
 local function dlog(...)
@@ -656,12 +657,25 @@ _beginReading so the xpointer-anchored paths can land here after their own
 view settles.
 --]]
 function SyncController:_beginReadingParsed(text, created_bar, keep_text)
-    -- Parse the full text into sentences and words
-    self.parsed_data = self.text_parser:parse(text)
+    local page_mode = self.tts_engine and self.tts_engine.isHTTPPageMode
+        and self.tts_engine:isHTTPPageMode()
+    self._http_page_generation = (self._http_page_generation or 0) + 1
+    self._http_page_preview_scheduled = false
+    self._http_page_transition = false
+    self._http_page_view = page_mode and HTTPPage.capture(self.plugin) or nil
+    if page_mode then
+        self.parsed_data = HTTPPage.parse(self.text_parser, text)
+        -- Page audio must not append a sentence from the next page or skip
+        -- a carry which was never included in this page's request.
+        self._tts_carry_skip, self._wrap_peek_text = nil, nil
+        self._spoken_norm = {}
+    else
+        self.parsed_data = self.text_parser:parse(text)
+    end
 
     local skipped_carry = 0
     local skipped_spoken = 0
-    if self.parsed_data then
+    if self.parsed_data and not page_mode then
         if not keep_text then
             skipped_carry = self:_skipCarriedPrefix(self.parsed_data, true)
             skipped_spoken = self:_skipAlreadySpoken(self.parsed_data)
@@ -670,6 +684,7 @@ function SyncController:_beginReadingParsed(text, created_bar, keep_text)
     end
 
     if not self.parsed_data or #self.parsed_data.sentences == 0 then
+        if page_mode then self.tts_engine:_cancelHTTP() end
         if (skipped_carry > 0 or skipped_spoken > 0)
                 and self.plugin
                 and self.plugin:getSetting("auto_advance", true) then
@@ -1242,6 +1257,12 @@ function SyncController:readNextSentence()
             return
         end
 
+        if controller.parsed_data and controller.parsed_data.http_page
+            and controller._http_page_view
+            and not HTTPPage.sameView(controller._http_page_view, controller.plugin) then
+            controller:stop()
+            return
+        end
         controller._android_tts_fail_count = 0
 
         -- Apply timing data to this sentence's words
@@ -1389,6 +1410,7 @@ function SyncController:beginSentencePlayback(sentence)
     local http_gap_padded = false
 
     if self.parsed_data and self.tts_engine.audio_player_type == "gst-bt"
+        and not sentence.http_page
         and (not is_http or self.tts_engine:_httpConcatFormat(self.tts_engine.current_audio_file)) then
         local synth_t0 = UIManager:getTime()
         local first_dur = self.tts_engine:getAudioDurationMs()
@@ -1843,8 +1865,60 @@ finishes, the next one's WAV is already on disk.
 @param explicit_idx number|nil  If provided, prefetch this sentence index
                                 instead of reading_sentence_idx + 1.
 --]]
+function SyncController:prefetchHTTPNextPage()
+    if self._http_page_preview_scheduled or not self._http_page_view
+        or not self.plugin or not self.plugin.peekNextPageText
+        or not self.plugin:getSetting("auto_advance", true) then return end
+    self._http_page_preview_scheduled = true
+    local generation = self._http_page_generation
+    UIManager:scheduleIn(0.2, function()
+        if generation ~= self._http_page_generation or self.state == self.STATE.STOPPED
+            or not (self.parsed_data and self.parsed_data.http_page)
+            or not HTTPPage.sameView(self._http_page_view, self.plugin) then return end
+        local ok, preview = pcall(self.plugin.peekNextPageText, self.plugin)
+        if generation ~= self._http_page_generation then return end
+        if not HTTPPage.sameView(self._http_page_view, self.plugin) then
+            self:stop()
+            return
+        end
+        if not ok or not preview or preview == "" then return end
+        local parsed = HTTPPage.parse(self.text_parser, preview)
+        -- A peek is only a cache hint, never the source for the actual next
+        -- page. The real settled page text must match this cache key exactly.
+        if #parsed.sentences > 0 and parsed.text ~= self.parsed_data.text then
+            self.tts_engine:prefetchHTTPSentences({ parsed.text }, 1)
+            logger.warn("SyncController: HTTP next page queued, chars=", #parsed.text)
+        end
+    end)
+end
+
+function SyncController:onHTTPPageViewChanged()
+    if not (self.parsed_data and self.parsed_data.http_page)
+        or self.state == self.STATE.STOPPED or self._http_page_transition then return false end
+    if HTTPPage.sameView(self._http_page_view, self.plugin) then return false end
+    logger.warn("SyncController: HTTP page view changed; stopping stale page audio")
+    self:stop()
+    return true
+end
+
+function SyncController:restartHTTPPageAtWord(index)
+    local suffix = HTTPPage.suffix(self.parsed_data, index)
+    if not suffix then return end
+    self._http_page_generation = (self._http_page_generation or 0) + 1
+    self:_cleanConcatFiles()
+    self.tts_engine:stop()
+    if self.highlight_manager then self.highlight_manager:clearHighlights() end
+    self.state = self.STATE.LOADING
+    self._highest_dispatched_idx = nil
+    self:start(suffix, { keep_text = true })
+end
+
 function SyncController:planHTTPAhead()
     if not self.tts_engine or self.tts_engine.backend ~= self.tts_engine.BACKENDS.PIPER_HTTP then return end
+    if self.parsed_data and self.parsed_data.http_page then
+        self:prefetchHTTPNextPage()
+        return
+    end
     local count = self.plugin and self.plugin:getSetting("piper_http_lookahead", 3) or 3
     count = math.max(0, math.min(8, math.floor(tonumber(count) or 3)))
     local texts = {}
@@ -1913,6 +1987,10 @@ Called when we're near the end of the current page's sentences so the
 page transition is near-instant.
 --]]
 function SyncController:_prefetchNextPage()
+    if self.parsed_data and self.parsed_data.http_page then
+        self:prefetchHTTPNextPage()
+        return
+    end
     if self._next_page_prefetched then return end
     if not self.plugin or not self.plugin.ui then return end
 
@@ -2309,6 +2387,12 @@ that highlight positioning, progress reporting, and page-end detection all
 use the new layout.
 --]]
 function SyncController:_remapAfterRotation()
+    if self.parsed_data and self.parsed_data.http_page then
+        self:stop()
+        local InfoMessage = require("ui/widget/infomessage")
+        UIManager:show(InfoMessage:new{ text = _("Page layout changed. Start page read-aloud again."), timeout = 5 })
+        return
+    end
     if not self.plugin then return end
 
     local fresh_text = self.plugin:getCurrentPageText()
@@ -2782,6 +2866,7 @@ Highlight the current sentence.
 @param sentence table Sentence object
 --]]
 function SyncController:highlightCurrentSentence(sentence)
+    if sentence and sentence.http_page then return end -- keep word highlights, not a page-wide selection
     if not sentence then
         return
     end
@@ -2800,6 +2885,7 @@ function SyncController:advanceToNextPage()
     end
 
     -- Mark as loading during page transition
+    self._http_page_transition = self.parsed_data and self.parsed_data.http_page or false
     self.state = self.STATE.LOADING
     self._chain_generation = (self._chain_generation or 0) + 1
     self.highlight_manager:clearHighlights()
@@ -3260,6 +3346,9 @@ end
 Stop playback completely.
 --]]
 function SyncController:stop(opts)
+    self._http_page_generation = (self._http_page_generation or 0) + 1
+    self._http_page_preview_scheduled = false
+    self._http_page_transition, self._http_page_view = false, nil
     -- Log at WARN level with traceback when stopping from an active state
     -- so we can diagnose unexpected stops (e.g. "Chain BLOCKED" on Kindle).
     -- Mirror the reason into the plugin debug log: bug reports usually
@@ -3505,6 +3594,10 @@ Based on how many sentences of the current page have been read.
 @return number
 --]]
 function SyncController:getProgress()
+    if self.parsed_data and self.parsed_data.http_page then
+        local count = #(self.parsed_data.words or {})
+        return count > 0 and math.max(0, math.min(100, (self.current_word_index or 0) / count * 100)) or 0
+    end
     if self.total_sentences > 0 then
         -- During a concat pipeline, the reading_sentence_idx points to
         -- sentence 1, but we may already be hearing sentence 5.  Use the
@@ -3602,6 +3695,10 @@ once instead of after the prefetched queue and the current concat group drain.
 Mirrors the primitives seekToProgress uses.
 --]]
 function SyncController:_restartFromCurrentSentence(target)
+    if self.parsed_data and self.parsed_data.http_page then
+        self:restartHTTPPageAtWord(self.current_word_index or 1)
+        return
+    end
     if not self.parsed_data or not self.total_sentences or self.total_sentences < 1 then
         return
     end
@@ -3664,6 +3761,11 @@ end
 -- Scrub the page: pct (0-1) maps onto the sentence index, playback restarts
 -- from that sentence.
 function SyncController:seekToProgress(pct)
+    if self.parsed_data and self.parsed_data.http_page then
+        local fraction = math.max(0, math.min(1, tonumber(pct) or 0))
+        self:restartHTTPPageAtWord(math.floor(#self.parsed_data.words * fraction) + 1)
+        return
+    end
     if not self.parsed_data or not self.total_sentences or self.total_sentences < 1 then
         return
     end
